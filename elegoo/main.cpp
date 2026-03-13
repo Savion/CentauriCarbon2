@@ -104,7 +104,7 @@ void chelper_log(const char *msg)
 
 int main(int argc, char *argv[])
 {
-#if 1
+#if 0
     elegoo::common::ElegooLog::get_instance().init_log(
         "elegoo", "/opt/usr/logs/", SPDLOG_LEVEL_INFO, true);
 #else

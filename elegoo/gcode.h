@@ -119,6 +119,8 @@ public:
     void cmd_ECHO(std::shared_ptr<GCodeCommand> gcmd);
     void cmd_STATUS(std::shared_ptr<GCodeCommand> gcmd);
     void cmd_HELP(std::shared_ptr<GCodeCommand> gcmd);
+    void cmd_DEBUG_STATUS(std::shared_ptr<GCodeCommand> gcmd);
+    void cmd_TEMPERATURE_WAIT(std::shared_ptr<GCodeCommand> gcmd);
     void process_commands(std::vector<std::string> commands, bool need_ack=true);
     std::vector<double> coord;
 private:

@@ -369,6 +369,16 @@ json Printer::connect(double eventtime)
         elegoo::common::SignalManager::get_instance().emit_signal(
             "elegoo:ready");
 
+        // Custom build startup banner
+        std::string sw_ver = start_args.count("software_version") ? start_args["software_version"] : "unknown";
+        std::string cpu    = start_args.count("cpu_info")         ? start_args["cpu_info"]         : "unknown";
+        SPDLOG_INFO("============================================");
+        SPDLOG_INFO("  CentauriCarbon2 Custom Build");
+        SPDLOG_INFO("  Compiled : {} {}", __DATE__, __TIME__);
+        SPDLOG_INFO("  Firmware : {}", sw_ver);
+        SPDLOG_INFO("  CPU      : {}", cpu);
+        SPDLOG_INFO("============================================");
+
         elegoo::common::SignalManager::get_instance().emit_signal(
             "elegoo:initialized");
     }

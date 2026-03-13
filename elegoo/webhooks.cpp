@@ -14,6 +14,7 @@
 #include "webhooks.h"
 #include "printer.h"
 #include "extras_factory.h"
+#include "heaters.h"
 
 const double SUBSCRIPTION_REFRESH_TIME = 0.5;
 // Constructor implementation
@@ -575,6 +576,8 @@ WebHooks::WebHooks(std::shared_ptr<Printer> printer) : printer(printer)
                       { handle_info_request(req); });
     register_endpoint("emergency_stop", [this](std::shared_ptr<WebRequest> req)
                       { handle_estop_request(req); });
+    register_endpoint("debug/info", [this](std::shared_ptr<WebRequest> req)
+                      { handle_debug_info_request(req); });
     SPDLOG_INFO("create WebHooks success!");
 }
 
@@ -696,6 +699,53 @@ void WebHooks::handle_info_request(std::shared_ptr<WebRequest> web_request)
 void WebHooks::handle_estop_request(std::shared_ptr<WebRequest> web_request)
 {
     printer->invoke_shutdown("Shutdown due to webhooks request");
+}
+
+void WebHooks::handle_debug_info_request(std::shared_ptr<WebRequest> web_request)
+{
+    json response;
+
+    // Printer state
+    std::string state_message, state;
+    std::tie(state_message, state) = printer->get_state_message();
+    response["state"] = state;
+    response["state_message"] = state_message;
+
+    // Build info from start_args
+    std::unordered_map<std::string, std::string> start_args = printer->get_start_args();
+    response["software_version"] = start_args.count("software_version") ? start_args["software_version"] : "unknown";
+    response["cpu_info"] = start_args.count("cpu_info") ? start_args["cpu_info"] : "unknown";
+    response["config_file"] = start_args.count("config_file") ? start_args["config_file"] : "unknown";
+
+    // Compile-time stamp (injected at build)
+    response["build_date"] = __DATE__;
+    response["build_time"] = __TIME__;
+
+    // Heater temperatures
+    json temps = json::object();
+    try
+    {
+        std::shared_ptr<elegoo::extras::PrinterHeaters> pheaters =
+            any_cast<std::shared_ptr<elegoo::extras::PrinterHeaters>>(
+                printer->lookup_object("heaters"));
+        double eventtime = get_monotonic();
+        for (const auto& name : pheaters->get_all_heaters())
+        {
+            auto heater = pheaters->lookup_heater(name);
+            auto t = heater->get_temp(eventtime);
+            temps[name] = {{"actual", t.first}, {"target", t.second}};
+        }
+    }
+    catch (...) {}
+    response["temperatures"] = temps;
+
+    // Loaded object names
+    json objects = json::array();
+    for (const auto& kv : printer->lookup_objects(""))
+        objects.push_back(kv.first);
+    response["objects"] = objects;
+
+    web_request->send(response);
 }
 
 std::function<void(std::shared_ptr<WebRequest>)> WebHooks::get_callback(const std::string &path)

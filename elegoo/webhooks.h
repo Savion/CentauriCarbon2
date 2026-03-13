@@ -149,6 +149,7 @@ public:
     void handle_list_endpoints(std::shared_ptr<WebRequest> web_request);
     void handle_info_request(std::shared_ptr<WebRequest> web_request);
     void handle_estop_request(std::shared_ptr<WebRequest> web_request);
+    void handle_debug_info_request(std::shared_ptr<WebRequest> web_request);
     std::shared_ptr<WebHooks> get_shared();
     std::pair<bool, std::string> stats(double eventtime);
     void broadcast_message(const json &json);

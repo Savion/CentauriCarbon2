@@ -598,7 +598,7 @@
  void GCodeDispatch::initialize_handlers()
  {
      SPDLOG_DEBUG("initialize_handlers");
-     std::vector<std::string> handlers = {"M110", "M112", "M115", "M2202", "RESTART", "FIRMWARE_RESTART", "ECHO", "STATUS", "HELP", "SET_CONDITION", "SET_CONDITION_END"};
+     std::vector<std::string> handlers = {"M110", "M112", "M115", "M2202", "RESTART", "FIRMWARE_RESTART", "ECHO", "STATUS", "HELP", "SET_CONDITION", "SET_CONDITION_END", "DEBUG_STATUS", "TEMPERATURE_WAIT"};
 
      for (const auto& cmd : handlers)
      {
@@ -679,6 +679,20 @@
                  [this](std::shared_ptr<GCodeCommand> gcmd){
                      cmd_HELP(gcmd);
                  }, true, "Report the list of available extended G-Code commands");
+         }
+         else if (cmd == "DEBUG_STATUS")
+         {
+             register_command(cmd,
+                 [this](std::shared_ptr<GCodeCommand> gcmd){
+                     cmd_DEBUG_STATUS(gcmd);
+                 }, true, "Report detailed debug status of the printer");
+         }
+         else if (cmd == "TEMPERATURE_WAIT")
+         {
+             register_command(cmd,
+                 [this](std::shared_ptr<GCodeCommand> gcmd){
+                     cmd_TEMPERATURE_WAIT(gcmd);
+                 }, false, "Wait for a heater or sensor to reach a target temperature");
          }
      }
  }
@@ -1029,6 +1043,106 @@
          result += cmd + "\n";
      }
      gcmd->respond_info(result, false);
+ }
+
+ void GCodeDispatch::cmd_DEBUG_STATUS(std::shared_ptr<GCodeCommand> gcmd)
+ {
+     std::string out;
+     auto state = printer->get_state_message();
+     out += "State:   " + state.second + "\n";
+     out += "Message: " + state.first + "\n";
+     out += "Ready:   " + std::string(is_printer_ready ? "yes" : "no") + "\n";
+
+     out += "\nRegistered G-Code commands (" + std::to_string(gcode_handlers->size()) + "):\n";
+     for (const auto& h : *gcode_handlers)
+     {
+         auto it = gcode_help.find(h.first);
+         if (it != gcode_help.end())
+             out += "  " + h.first + ": " + it->second + "\n";
+         else
+             out += "  " + h.first + "\n";
+     }
+
+     try
+     {
+         std::shared_ptr<elegoo::extras::PrinterHeaters> pheaters =
+             any_cast<std::shared_ptr<elegoo::extras::PrinterHeaters>>(
+                 printer->lookup_object("heaters"));
+         double eventtime = get_monotonic();
+         auto heater_names = pheaters->get_all_heaters();
+         if (!heater_names.empty())
+         {
+             out += "\nTemperatures:\n";
+             for (const auto& name : heater_names)
+             {
+                 auto heater = pheaters->lookup_heater(name);
+                 auto temps = heater->get_temp(eventtime);
+                 char buf[64];
+                 snprintf(buf, sizeof(buf), "  %-16s actual=%.1f  target=%.1f\n",
+                     name.c_str(), temps.first, temps.second);
+                 out += buf;
+             }
+         }
+     }
+     catch (...)
+     {
+         out += "\nTemperature info unavailable.\n";
+     }
+
+     gcmd->respond_info(out, false);
+ }
+
+ void GCodeDispatch::cmd_TEMPERATURE_WAIT(std::shared_ptr<GCodeCommand> gcmd)
+ {
+     std::string sensor = gcmd->get("SENSOR");
+     if (sensor == "_invalid_")
+     {
+         throw elegoo::common::CommandError("TEMPERATURE_WAIT: SENSOR parameter is required");
+     }
+     double min_temp = gcmd->get_double("MINIMUM", DOUBLE_NONE);
+     double max_temp = gcmd->get_double("MAXIMUM", DOUBLE_NONE);
+     if (std::isnan(min_temp) && std::isnan(max_temp))
+     {
+         throw elegoo::common::CommandError("TEMPERATURE_WAIT: MINIMUM and/or MAXIMUM required");
+     }
+
+     std::shared_ptr<elegoo::extras::PrinterHeaters> pheaters;
+     try
+     {
+         pheaters = any_cast<std::shared_ptr<elegoo::extras::PrinterHeaters>>(
+             printer->lookup_object("heaters"));
+     }
+     catch (...)
+     {
+         throw elegoo::common::CommandError("TEMPERATURE_WAIT: heater module not available");
+     }
+
+     std::shared_ptr<elegoo::extras::Heater> heater;
+     try
+     {
+         heater = pheaters->lookup_heater(sensor);
+     }
+     catch (...)
+     {
+         throw elegoo::common::CommandError("TEMPERATURE_WAIT: unknown sensor '" + sensor + "'");
+     }
+
+     std::shared_ptr<SelectReactor> reactor = printer->get_reactor();
+     double eventtime = get_monotonic();
+     while (!printer->is_shutdown())
+     {
+         auto temps = heater->get_temp(eventtime);
+         double current = temps.first;
+         bool above_min = std::isnan(min_temp) || (current >= min_temp);
+         bool below_max = std::isnan(max_temp) || (current <= max_temp);
+         if (above_min && below_max)
+             break;
+         char buf[64];
+         snprintf(buf, sizeof(buf), "T:%.1f /%.1f", current, temps.second);
+         gcmd->respond_raw(std::string(buf));
+         eventtime = reactor->pause(eventtime + 1.0);
+     }
+     gcmd->ack();
  }
 
  void GCodeDispatch::build_status_commands()
