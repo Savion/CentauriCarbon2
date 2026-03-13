@@ -167,7 +167,7 @@ namespace elegoo
         {
             auto whbatch = std::make_shared<BatchWebhooksClient>(web_request, any2json);
             add_client([whbatch](const Any &msg) -> bool
-                       { whbatch->handle_batch(msg); });
+                       { whbatch->handle_batch(msg); return true; });
             web_request->send(webhooks_start_resp);
         }
 

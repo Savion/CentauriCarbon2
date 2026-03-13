@@ -152,6 +152,7 @@ namespace elegoo
                     [aqh](Any msg)->bool
                     {
                         aqh->handle_batch(msg);
+                        return true;
                     });
             return aqh;
         }

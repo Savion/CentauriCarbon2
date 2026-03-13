@@ -22,7 +22,7 @@ namespace elegoo
             : printer(printer), mcu_stepper(mcu_stepper), last_batch_clock(0)
         {
             batch_bulk = std::make_shared<BatchBulkHelper>(printer, [this](double time) -> Any
-                                                           { this->process_batch(time); });
+                                                           { return this->process_batch(time); });
             json api_resp;
             api_resp["header"] = json::array(); // 初始化为数组类型
             api_resp["header"].push_back("interval");
@@ -141,7 +141,7 @@ namespace elegoo
             // Add the "header" array to the main JSON object
             api_resp["header"] = header;
             batch_bulk = std::make_shared<BatchBulkHelper>(printer, [this](double time) -> Any
-                                                           { this->_process_batch(time); });
+                                                           { return this->_process_batch(time); });
             batch_bulk->add_mux_endpoint("motion_report/dump_trapq", "name", name, api_resp);
         }
 
@@ -358,7 +358,7 @@ namespace elegoo
         void PrinterMotionReport::_shutdown()
         {
             printer->get_reactor()->register_callback([this](double eventtime) -> double
-                                                      { this->_dump_shutdown(eventtime); });
+                                                      { return this->_dump_shutdown(eventtime); });
         }
 
         json PrinterMotionReport::get_status(double eventtime)

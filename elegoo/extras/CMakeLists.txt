@@ -73,6 +73,11 @@ add_library(elegoo_extras SHARED
     cavity_fan.cpp
 )
 
+# On x86_64 there is no prebuilt ARM bedmesh library, so provide stubs
+if(COMPILER_PLATFORM STREQUAL "x86_64")
+    target_sources(elegoo_extras PRIVATE bedmesh_x64_stubs.cpp)
+endif()
+
 target_link_libraries(elegoo_extras
     PRIVATE "${CMAKE_SOURCE_DIR}/lib/fftw/bin/${COMPILER_PLATFORM}/libfftw3.so.3"
     PRIVATE utilities

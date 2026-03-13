@@ -57,8 +57,8 @@ MCU_host_digital_pin::MCU_host_digital_pin(std::shared_ptr<PinParams> pin_params
         close(fd);
     }
     // 3. 获取读写接口
-    char direction[256];
-    char value[256];
+    char direction[512];
+    char value[512];
     snprintf(direction, sizeof(direction), "%s/direction", pin_dir);
     snprintf(value, sizeof(value), "%s/value", pin_dir);
     if ((fd_direction = open(direction, O_RDWR)) == -1)

@@ -481,6 +481,7 @@ namespace elegoo
                 this->reactor->pause(get_monotonic() + 1.);
             }
             SPDLOG_INFO("__func__:{} #1 next_state:{} is_auto_detect:{}",__func__,(int32_t)this->next_state,this->is_auto_detect);
+            return 0.0;
         }
 
         std::shared_ptr<AutoDetect> rfauto_detect_load_config(std::shared_ptr<ConfigWrapper> config)

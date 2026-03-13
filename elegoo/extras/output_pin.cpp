@@ -263,6 +263,7 @@ namespace elegoo
 
         std::shared_ptr<PrinterTemplateEvaluator> lookup_template_eval(std::shared_ptr<ConfigWrapper> config)
         {
+            return nullptr;
         }
 
         std::shared_ptr<PrinterOutputPin> output_pin_load_config_prefix(

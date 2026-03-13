@@ -210,7 +210,7 @@ check_line(struct stepcompress *sc, struct step_move move)
     if (!move.count || (!move.interval && !move.add && move.count > 1)
         || move.interval >= 0x80000000) {
         errorf("stepcompress o=%d i=%u c=%d a=%d last_clock=%llu queue_pos=%u, : Invalid sequence"
-               , sc->oid, move.interval, move.count, move.add, sc->last_step_clock, *sc->queue_pos);
+               , sc->oid, move.interval, move.count, move.add, (unsigned long long)sc->last_step_clock, *sc->queue_pos);
         return ERROR_RET;
     }
     uint32_t interval = move.interval, p = 0;

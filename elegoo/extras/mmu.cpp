@@ -2434,7 +2434,7 @@ double Canvas::cutting_knife_handler(double eventtime, bool state)
 
 double Canvas::model_det_handler(double eventtime, bool state)
 {
-
+    return 0.0;
 }
 
 double Canvas::info_report_handler(double eventtime)

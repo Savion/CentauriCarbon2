@@ -870,7 +870,7 @@ namespace elegoo
                           base_position[0], base_position[1], base_position[2], base_position[3],
                           last_position[0], last_position[1], last_position[2], last_position[3],
                           homing_position[0], homing_position[1], homing_position[2], homing_position[3],
-                          homing_position, speed_factor, extrude_factor, speed);
+                          speed_factor, extrude_factor, speed);
             SPDLOG_WARN(buffer);
         }
 

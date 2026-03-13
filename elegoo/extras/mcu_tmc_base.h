@@ -19,10 +19,10 @@ class FieldHelper;
 class MCU_TMC_Base {
 public:
   virtual ~MCU_TMC_Base() = default;
-  virtual std::shared_ptr<FieldHelper> get_fields() const {}
-  virtual uint32_t get_register(const std::string& reg_name) {}
+  virtual std::shared_ptr<FieldHelper> get_fields() const { return nullptr; }
+  virtual uint32_t get_register(const std::string& reg_name) { return 0; }
   virtual void set_register(const std::string& reg_name, int64_t val, double print_time = DOUBLE_NONE) {}  //to confirm
-  virtual uint32_t get_tmc_frequency() const {};
+  virtual uint32_t get_tmc_frequency() const { return 0; };
 
  private: 
 

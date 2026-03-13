@@ -364,6 +364,7 @@ bool SerialBootloader::jump_to_bootloader()
     // printf("try jump to bootloader\n");
 #define MAGIC " \x1c Request Serial Bootloader!! ~"
     serial->write(MAGIC, sizeof(MAGIC) - 1);
+    return true;
 }
 
 bool SerialBootloader::update(const char *firmware)
@@ -404,7 +405,7 @@ bool SerialBootloader::update(const char *firmware)
         // 编程FLASH
         uint32_t flash_start = foffset;
         uint32_t flash_end = foffset + flength;
-        printf("flash_start %d flash_end %d flength %d\n", flash_start, flash_end, flength);
+        printf("flash_start %u flash_end %u flength %zd\n", flash_start, flash_end, flength);
         uint32_t len = 0;
         do
         {

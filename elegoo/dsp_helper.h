@@ -20,7 +20,6 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/ioctl.h>
-#include "asm-generic/termbits.h"
 #include "rpmsg.h"
 #include "common/logger.h"
 

@@ -551,6 +551,7 @@ std::pair<bool, std::string> ServerSocket::stats(double eventtime)
             ++it;
         }
     }
+    return {true, ""};
 }
 
 void ServerSocket::broadcast_message(const json &json) // 发送广播到客户端

@@ -239,7 +239,6 @@ std::shared_ptr<MCU_SPI> MCU_SPI_from_config(
     // Create MCU_SPI object
     return std::make_shared<MCU_SPI>(mcu, bus, pin, mode, speed,
         sw_pins, cs_active_high);
-    SPDLOG_DEBUG("__func__:{} #2",__func__);
 }
 
 

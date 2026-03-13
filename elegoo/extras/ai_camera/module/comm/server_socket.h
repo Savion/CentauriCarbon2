@@ -8,6 +8,7 @@
  * Copyright (c) 2025 by ELEGOO, All Rights Reserved. 
  *****************************************************************************/
 #pragma once
+#include <functional>
 
 #include <mutex>
 #include <iostream>

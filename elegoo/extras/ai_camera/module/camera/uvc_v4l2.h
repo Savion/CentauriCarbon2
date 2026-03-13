@@ -16,6 +16,8 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <atomic>
+#include <cstdint>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>

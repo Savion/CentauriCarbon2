@@ -171,6 +171,7 @@ namespace elegoo
         {
             sensor_enable = state;
             SPDLOG_DEBUG("filament motion sensor, switch state = {}", state);
+            return 0.0;
         }
 
         std::shared_ptr<EncoderSensor> encoder_sensor_load_config_prefix(std::shared_ptr<ConfigWrapper> config)

@@ -21,7 +21,26 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/ioctl.h>
-#include "asm-generic/termbits.h"
+
+// termios2 is a kernel struct for custom baud rates; not exposed by glibc.
+// Guard against asm-generic/termbits.h already providing these definitions.
+#ifndef __ASM_GENERIC_TERMBITS_H
+# ifndef BOTHER
+#  define BOTHER 0010000
+#  define TCGETS2 _IOR('T', 0x2A, struct termios2)
+#  define TCSETS2 _IOW('T', 0x2B, struct termios2)
+struct termios2 {
+    tcflag_t c_iflag;
+    tcflag_t c_oflag;
+    tcflag_t c_cflag;
+    tcflag_t c_lflag;
+    cc_t     c_line;
+    cc_t     c_cc[19];
+    speed_t  c_ispeed;
+    speed_t  c_ospeed;
+};
+# endif
+#endif
 
 class SerialPort
 {

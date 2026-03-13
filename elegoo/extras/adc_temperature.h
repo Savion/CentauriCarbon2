@@ -95,9 +95,9 @@ class CustomLinearBase {
  public:
   CustomLinearBase(std::shared_ptr<ConfigWrapper> config){};
   virtual std::shared_ptr<PrinterADCtoTemperature> create(
-      std::shared_ptr<ConfigWrapper> config){};
+      std::shared_ptr<ConfigWrapper> config){ return nullptr; };
 
-  virtual std::shared_ptr<LinearBase> get_liner(std::shared_ptr<ConfigWrapper> config) {};
+  virtual std::shared_ptr<LinearBase> get_liner(std::shared_ptr<ConfigWrapper> config) { return nullptr; };
   std::string name;
   std::vector<std::pair<double, double>> params;
 };

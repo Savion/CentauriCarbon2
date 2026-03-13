@@ -14,6 +14,7 @@
 #include <vector>
 #include <limits>
 #include <unordered_map>
+#include <cstdint>
 
 constexpr int INT_NONE = std::numeric_limits<int>::min();
 constexpr double DOUBLE_NONE = std::numeric_limits<double>::quiet_NaN();

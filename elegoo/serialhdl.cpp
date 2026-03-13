@@ -26,7 +26,6 @@
 #include "utilities.h"
 #include "common/logger.h"
 #include "exception_handler.h"
-#include "asm-generic/termbits.h"
 #include <dirent.h>
 #include <string.h>
 #include <stdio.h>

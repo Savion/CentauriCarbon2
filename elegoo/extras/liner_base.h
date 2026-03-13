@@ -20,8 +20,8 @@ class LinearBase {
   LinearBase(std::shared_ptr<ConfigWrapper> config,
              const std::vector<std::pair<double, double>>& params){};
   LinearBase(const float pullup, const float inline_resistor){};
-  virtual double calc_temp(double adc) const {};
-  virtual double calc_adc(double temp) const {};
+  virtual double calc_temp(double adc) const { return 0.0; };
+  virtual double calc_adc(double temp) const { return 0.0; };
 
  private:
   // std::shared_ptr<LinearInterpolate> li;

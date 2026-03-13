@@ -194,6 +194,7 @@ BaseRotaryEncoder::BaseRotaryEncoder(Callback cw_callback, Callback ccw_callback
 double BaseRotaryEncoder::encoder_callback(double eventtime, int state) {
     // 需要根据具体的编码器状态表来更新当前状态和回调
     // 这里是一个占位符，子类会重写此方法
+    return 0.0;
 }
 
 const int FullStepRotaryEncoder::ENCODER_STATES[7][4] = {
@@ -225,6 +226,7 @@ double FullStepRotaryEncoder::encoder_callback(double eventtime, int state) {
     } else if (es & R_DIR_MSK == R_DIR_CCW) {
         ccw_callback(eventtime);
     }
+    return 0.0;
 }
 
 const int HalfStepRotaryEncoder::ENCODER_STATES[6][4] = {

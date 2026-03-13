@@ -67,17 +67,17 @@ namespace elegoo
             AccelChip(std::shared_ptr<ConfigWrapper> config){};
             virtual ~AccelChip(){SPDLOG_DEBUG("~AccelChip");};
             virtual void init(std::shared_ptr<ConfigWrapper> config){};
-            virtual uint8_t read_reg(uint8_t reg){};
+            virtual uint8_t read_reg(uint8_t reg){ return 0; };
             virtual void set_reg(uint8_t reg, uint8_t val,uint64_t minclock = 0){};
-            virtual std::shared_ptr<AccelQueryHelper> start_internal_client(){};
-            virtual json get_accel_status(){};
+            virtual std::shared_ptr<AccelQueryHelper> start_internal_client(){ return nullptr; };
+            virtual json get_accel_status(){ return {}; };
             virtual std::string get_name(){return name;};
         private:
             virtual void _build_config(){};
             virtual void _convert_samples(std::vector<FixedFreqReader::FixedFreqReaderSamples> &samples){};
             virtual void _start_measurements(){};
             virtual void _finish_measurements(){};
-            virtual Any _process_batch(double eventtime){};
+            virtual Any _process_batch(double eventtime){ return {}; };
         // protected:
         public:
             std::shared_ptr<Printer> printer;

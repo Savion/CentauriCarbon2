@@ -564,7 +564,7 @@ double DummyExtruder::find_past_position(double print_time)
 
 double DummyExtruder::calc_junction(Move* prev_move, Move* move)
 {
-    move->max_cruise_v2;
+    return move->max_cruise_v2;
 }
 
 std::string DummyExtruder::get_name()

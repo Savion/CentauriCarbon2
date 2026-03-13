@@ -20,7 +20,6 @@ else()
     message(WARNING "The toolchain information is not specified, using the system default configuration.")
 endif()
 
-
 # 头文件路径列表
 set(PROJECT_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}
@@ -50,6 +49,7 @@ include_directories(${PROJECT_INCLUDE_DIRS})
 add_subdirectory(chelper)
 add_subdirectory(extras)
 add_subdirectory(extras/ai_camera)
+set_target_properties(ai_camera PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 add_subdirectory(kinematics)
 add_subdirectory(common)
 
@@ -86,14 +86,26 @@ file(GLOB OPENSSL_CRYPTO_FILES "${CMAKE_SOURCE_DIR}/lib/openssl/bin/${COMPILER_P
 set(THIRD_PARTY_LIBS
     ${CMAKE_SOURCE_DIR}/lib/libco/bin/${COMPILER_PLATFORM}/libcolib.so
     ${CMAKE_SOURCE_DIR}/lib/simpleini/bin/${COMPILER_PLATFORM}/libconvertutf.so
-    ${CMAKE_SOURCE_DIR}/lib/fftw/bin/${COMPILER_PLATFORM}/libfftw3.so.3
-    ${CMAKE_SOURCE_DIR}/lib/spdlog/bin/${COMPILER_PLATFORM}/libspdlog.so
-    ${CMAKE_SOURCE_DIR}/extras/bedmesh/${COMPILER_PLATFORM}/libelegoo_bed_mesh.so
+)
+
+# Glob flexibly for .so and .so.N variants
+file(GLOB FFTW_FILES "${CMAKE_SOURCE_DIR}/lib/fftw/bin/${COMPILER_PLATFORM}/libfftw3.so*")
+file(GLOB SPDLOG_FILES "${CMAKE_SOURCE_DIR}/lib/spdlog/bin/${COMPILER_PLATFORM}/libspdlog.so*")
+file(GLOB BEDMESH_FILE "${CMAKE_SOURCE_DIR}/extras/bedmesh/${COMPILER_PLATFORM}/libelegoo_bed_mesh.so")
+
+list(APPEND THIRD_PARTY_LIBS 
+    ${FFTW_FILES}
+    ${SPDLOG_FILES}
+    ${BEDMESH_FILE}
     ${OPENSSL_ZLIB_FILES}
     ${CURL_FILES}
     ${OPENSSL_SSL_FILES}
     ${OPENSSL_CRYPTO_FILES}
 )
+
+# Filter out empty results
+list(FILTER THIRD_PARTY_LIBS EXCLUDE REGEX "^$")
+
 target_link_libraries(elegoo_printer
     ${THIRD_PARTY_LIBS}
     elegoo_log
@@ -163,9 +175,10 @@ else()
 endif()
 
 # 安装可执行文件
-install(TARGETS 
-    elegoo_printer 
+install(TARGETS
+    elegoo_printer
     debug_window
+    ai_camera
     RUNTIME DESTINATION ${INSTALL_DIR}
 )
 

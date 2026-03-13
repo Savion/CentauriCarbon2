@@ -35,7 +35,7 @@ public:
     virtual json get_status(double eventtime) = 0;
     virtual std::vector<std::shared_ptr<PrinterRail>> get_rails() { return {}; };
     virtual void clear_homing_state(const std::vector<int> &clear_axes) {};
-    virtual std::vector<std::vector<double>> get_rails_range() {};
-    virtual double get_max_z_velocity() {};
-    virtual double get_max_z_accel() {};
+    virtual std::vector<std::vector<double>> get_rails_range() { return {}; };
+    virtual double get_max_z_velocity() { return 0.0; };
+    virtual double get_max_z_accel() { return 0.0; };
 };
