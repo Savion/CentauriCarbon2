@@ -49,6 +49,8 @@ include_directories(${PROJECT_INCLUDE_DIRS})
 add_subdirectory(chelper)
 add_subdirectory(extras)
 add_subdirectory(extras/ai_camera)
+add_subdirectory(moonraker_bridge moonraker_bridge_build)
+set_target_properties(moonraker_bridge PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 set_target_properties(ai_camera PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 add_subdirectory(kinematics)
 add_subdirectory(common)
@@ -179,6 +181,7 @@ install(TARGETS
     elegoo_printer
     debug_window
     ai_camera
+    moonraker_bridge
     RUNTIME DESTINATION ${INSTALL_DIR}
 )
 
