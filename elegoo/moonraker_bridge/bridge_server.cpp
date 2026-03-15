@@ -636,18 +636,25 @@ void BridgeServer::setup_http_routes(hv::HttpService& svc) {
     svc.POST("/server/job_queue/job", [this](HttpRequest* req, HttpResponse* resp) -> int {
         json body;
         try { body = json::parse(req->body); } catch (...) {}
-        std::string filename = body.value("filename", req->GetParam("filename"));
         resp->content_type = APPLICATION_JSON;
-        if (filename.empty()) {
-            resp->body = "{\"error\":{\"message\":\"filename required\",\"code\":400}}"; return 400;
-        }
         std::lock_guard<std::mutex> lock(jq_mutex);
-        json job;
-        job["job_id"]        = "job_" + std::to_string(jq_id_counter++);
-        job["filename"]      = filename;
-        job["time_added"]    = (double)time(nullptr);
-        job["time_in_queue"] = 0.0;
-        job_queue.push_back(job);
+        auto add_job_http = [this](const std::string& fname) {
+            json job;
+            job["job_id"]        = "job_" + std::to_string(jq_id_counter++);
+            job["filename"]      = fname;
+            job["time_added"]    = (double)time(nullptr);
+            job["time_in_queue"] = 0.0;
+            job_queue.push_back(job);
+        };
+        if (body.contains("filenames") && body["filenames"].is_array()) {
+            for (auto& fn : body["filenames"]) add_job_http(fn.get<std::string>());
+        } else {
+            std::string filename = body.value("filename", req->GetParam("filename"));
+            if (filename.empty()) {
+                resp->body = "{\"error\":{\"message\":\"filename required\",\"code\":400}}"; return 400;
+            }
+            add_job_http(filename);
+        }
         json r; r["queued_jobs"] = job_queue; r["queue_state"] = queue_state;
         json out; out["result"] = r;
         resp->body = out.dump();
@@ -845,6 +852,45 @@ void BridgeServer::setup_http_routes(hv::HttpService& svc) {
 
     svc.GET("/machine/*",            json_404);
     svc.POST("/machine/*",           json_404);
+
+    // ── Announcements HTTP ────────────────────────────────────────────────
+    svc.GET("/server/announcements", [](HttpRequest*, HttpResponse* resp) -> int {
+        json out; out["result"] = {{"entries", json::array()}, {"feeds", json::array()}};
+        resp->content_type = APPLICATION_JSON; resp->body = out.dump(); return 200;
+    });
+    svc.POST("/server/announcements/dismiss", [](HttpRequest*, HttpResponse* resp) -> int {
+        json out; out["result"] = json::object();
+        resp->content_type = APPLICATION_JSON; resp->body = out.dump(); return 200;
+    });
+
+    // ── Power devices HTTP ────────────────────────────────────────────────
+    svc.GET("/machine/device_power/devices", [](HttpRequest*, HttpResponse* resp) -> int {
+        json out; out["result"] = {{"devices", json::array()}};
+        resp->content_type = APPLICATION_JSON; resp->body = out.dump(); return 200;
+    });
+    svc.GET("/machine/device_power/status",  json_404);
+    svc.POST("/machine/device_power/on",     json_404);
+    svc.POST("/machine/device_power/off",    json_404);
+    svc.POST("/machine/device_power/toggle", json_404);
+
+    // ── Update Manager HTTP ───────────────────────────────────────────────
+    svc.GET("/machine/update/status", [](HttpRequest*, HttpResponse* resp) -> int {
+        json out; out["result"] = {{"busy", false}, {"version_info", json::object()},
+                                    {"github_rate_limit_reset_time", 0}};
+        resp->content_type = APPLICATION_JSON; resp->body = out.dump(); return 200;
+    });
+
+    // ── Spoolman HTTP ─────────────────────────────────────────────────────
+    svc.GET("/server/spoolman/spool_id", [](HttpRequest*, HttpResponse* resp) -> int {
+        json out; out["result"] = {{"spool_id", json(nullptr)}};
+        resp->content_type = APPLICATION_JSON; resp->body = out.dump(); return 200;
+    });
+
+    // ── Sensors HTTP ──────────────────────────────────────────────────────
+    svc.GET("/server/sensors/list", [](HttpRequest*, HttpResponse* resp) -> int {
+        json out; out["result"] = {{"sensors", json::object()}};
+        resp->content_type = APPLICATION_JSON; resp->body = out.dump(); return 200;
+    });
 
     // ── Static web UI (Mainsail / Fluidd) ────────────────────────────────
     // Must be registered LAST so all API routes above take priority.
@@ -1137,6 +1183,49 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
         return;
     }
 
+    // ── Announcements ─────────────────────────────────────────────────────
+    if (method == "server.announcements.list") {
+        json r;
+        r["entries"] = json::array();
+        r["feeds"]   = json::array();
+        send_response(r);
+        return;
+    }
+    if (method == "server.announcements.dismiss" ||
+        method == "server.announcements.update_read") {
+        send_response(json::object());
+        return;
+    }
+
+    // ── Power devices (machine.device_power.*) ────────────────────────────
+    if (method == "machine.device_power.devices") {
+        json r; r["devices"] = json::array();
+        send_response(r);
+        return;
+    }
+    if (method == "machine.device_power.status" ||
+        method == "machine.device_power.on"     ||
+        method == "machine.device_power.off"    ||
+        method == "machine.device_power.toggle") {
+        send_response(json::object());
+        return;
+    }
+
+    // ── Spoolman (optional, stub so panel doesn't error) ─────────────────
+    if (method == "server.spoolman.get_spool_id" ||
+        method == "server.spoolman.set_active_spool" ||
+        method == "server.spoolman.proxy") {
+        send_response(json::object());
+        return;
+    }
+
+    // ── Sensor data ───────────────────────────────────────────────────────
+    if (method == "server.sensors.list") {
+        json r; r["sensors"] = json::object();
+        send_response(r);
+        return;
+    }
+
     if (method == "server.files.metadata") {
         // Mainsail polls this for the currently-loaded file.
         // Return an empty object — no file loaded.
@@ -1177,28 +1266,40 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
         return;
     }
     if (method == "server.job_queue.post_job") {
-        std::string filename = params.value("filename", "");
-        if (filename.empty()) { send_error("filename required"); return; }
+        // Mainsail sends filenames as an array: {filenames: ["a.gcode", "b.gcode"]}
+        // (but older versions may send singular filename)
         std::lock_guard<std::mutex> lock(jq_mutex);
-        json job;
-        job["job_id"]        = "job_" + std::to_string(jq_id_counter++);
-        job["filename"]      = filename;
-        job["time_added"]    = (double)time(nullptr);
-        job["time_in_queue"] = 0.0;
-        job_queue.push_back(job);
+        auto add_job = [this](const std::string& fname) {
+            json job;
+            job["job_id"]        = "job_" + std::to_string(jq_id_counter++);
+            job["filename"]      = fname;
+            job["time_added"]    = (double)time(nullptr);
+            job["time_in_queue"] = 0.0;
+            job_queue.push_back(job);
+        };
+        if (params.contains("filenames") && params["filenames"].is_array()) {
+            for (auto& fn : params["filenames"]) add_job(fn.get<std::string>());
+        } else if (params.contains("filename")) {
+            add_job(params["filename"].get<std::string>());
+        }
         json r; r["queued_jobs"] = job_queue; r["queue_state"] = queue_state;
         send_response(r);
         return;
     }
     if (method == "server.job_queue.delete_job") {
-        json ids = params.value("job_ids", json::array());
-        std::set<std::string> to_remove;
-        if (ids.is_array()) for (auto& jid : ids) to_remove.insert(jid.get<std::string>());
+        // Supports {all: true} to clear queue, or {job_ids: [...]}
         std::lock_guard<std::mutex> lock(jq_mutex);
-        std::vector<json> remaining;
-        for (auto& job : job_queue)
-            if (!to_remove.count(job["job_id"].get<std::string>())) remaining.push_back(job);
-        job_queue = remaining;
+        if (params.value("all", false)) {
+            job_queue.clear();
+        } else {
+            json ids = params.value("job_ids", json::array());
+            std::set<std::string> to_remove;
+            if (ids.is_array()) for (auto& jid : ids) to_remove.insert(jid.get<std::string>());
+            std::vector<json> remaining;
+            for (auto& job : job_queue)
+                if (!to_remove.count(job["job_id"].get<std::string>())) remaining.push_back(job);
+            job_queue = remaining;
+        }
         json r; r["queued_jobs"] = job_queue; r["queue_state"] = queue_state;
         send_response(r);
         return;
