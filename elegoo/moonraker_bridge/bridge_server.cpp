@@ -283,9 +283,27 @@ void BridgeServer::setup_http_routes(hv::HttpService& svc) {
     svc.GET("/server/database/item", [this](HttpRequest* req, HttpResponse* resp) -> int {
         std::string ns  = req->GetParam("namespace");
         std::string key = req->GetParam("key");
-        std::string db_key = ns + "\x1f" + key;
         resp->content_type = APPLICATION_JSON;
         std::lock_guard<std::mutex> lock(db_mutex);
+
+        if (key.empty()) {
+            // No key — return ALL items in this namespace as a value object.
+            // Used by Mainsail's loadBackupableNamespaces feature.
+            json values = json::object();
+            std::string prefix = ns + "\x1f";
+            for (auto& kv : db_store) {
+                if (kv.first.size() > prefix.size() &&
+                    kv.first.substr(0, prefix.size()) == prefix) {
+                    values[kv.first.substr(prefix.size())] = kv.second;
+                }
+            }
+            json r; r["namespace"] = ns; r["key"] = json(nullptr); r["value"] = values;
+            json out; out["result"] = r;
+            resp->body = out.dump();
+            return 200;
+        }
+
+        std::string db_key = ns + "\x1f" + key;
         auto it = db_store.find(db_key);
         if (it == db_store.end()) {
             resp->body = "{\"error\":{\"message\":\"Key not found\",\"code\":404}}";
@@ -668,6 +686,21 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
         json r;
         r["webcams"] = json::array();
         send_response(r);
+        return;
+    }
+
+    if (method == "server.webcams.post_item" ||
+        method == "server.webcams.update_item") {
+        // Accept webcam creation/update — no actual webcam on CC2,
+        // so just echo the params back as a confirmation.
+        json r = params; // echo back whatever was sent
+        if (!r.contains("uid")) r["uid"] = "";
+        send_response(r);
+        return;
+    }
+
+    if (method == "server.webcams.delete_item") {
+        send_response(json::object());
         return;
     }
 
