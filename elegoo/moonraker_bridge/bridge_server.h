@@ -64,4 +64,10 @@ private:
     // Key format: "namespace\x1fkey"
     std::mutex db_mutex;
     std::map<std::string, json> db_store;
+
+    // In-memory job queue (Mainsail job queue panel)
+    std::mutex jq_mutex;
+    std::vector<json> job_queue;          // list of {job_id, filename, time_added}
+    std::string queue_state = "ready";    // "ready" | "paused" | "loading" | "error"
+    uint64_t jq_id_counter = 1;
 };

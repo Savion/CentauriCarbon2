@@ -8,8 +8,122 @@
 #include <sstream>
 #include <thread>
 #include <chrono>
+#include <algorithm>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <unistd.h>
 #include "hv/HttpMessage.h"
 #include "hv/HttpContext.h"
+
+// ── Filesystem helpers ─────────────────────────────────────────────────────
+static const std::string GCODE_ROOT  = "/opt/usr/gcode";
+static const std::string CONFIG_ROOT = "/opt/usr/config";
+static const std::string LOGS_ROOT   = "/home/eeb001/printer_data/logs";
+
+static std::string root_to_path(const std::string& root) {
+    if (root == "gcodes") return GCODE_ROOT;
+    if (root == "config") return CONFIG_ROOT;
+    if (root == "logs")   return LOGS_ROOT;
+    return "";
+}
+
+// Returns a JSON object like {"filename":"foo.gcode","size":N,"modified":T,"permissions":"rw"}
+static json file_to_json(const std::string& name, const std::string& full_path,
+                          const std::string& permissions = "rw") {
+    struct stat st;
+    json f;
+    f["filename"] = name;
+    f["permissions"] = permissions;
+    if (stat(full_path.c_str(), &st) == 0) {
+        f["size"]     = (int64_t)st.st_size;
+        f["modified"] = (double)st.st_mtime;
+    } else {
+        f["size"]     = 0;
+        f["modified"] = 0.0;
+    }
+    return f;
+}
+
+// Read directory; returns JSON object with dirs/files/disk_usage/root_info
+static json read_directory(const std::string& dir_path, const std::string& root_name,
+                            const std::string& permissions = "rw") {
+    json dirs  = json::array();
+    json files = json::array();
+
+    DIR* d = opendir(dir_path.c_str());
+    if (d) {
+        struct dirent* ent;
+        while ((ent = readdir(d)) != nullptr) {
+            std::string name = ent->d_name;
+            if (name == "." || name == "..") continue;
+            std::string full = dir_path + "/" + name;
+            struct stat st;
+            if (stat(full.c_str(), &st) != 0) continue;
+            if (S_ISDIR(st.st_mode)) {
+                json dj;
+                dj["dirname"]     = name;
+                dj["size"]        = 0;
+                dj["modified"]    = (double)st.st_mtime;
+                dj["permissions"] = permissions;
+                dirs.push_back(dj);
+            } else if (S_ISREG(st.st_mode)) {
+                files.push_back(file_to_json(name, full, permissions));
+            }
+        }
+        closedir(d);
+    }
+
+    // disk usage
+    json disk;
+    struct statvfs svfs;
+    if (statvfs(dir_path.c_str(), &svfs) == 0) {
+        uint64_t bsize = svfs.f_frsize ? svfs.f_frsize : svfs.f_bsize;
+        disk["total"] = (int64_t)(svfs.f_blocks * bsize);
+        disk["used"]  = (int64_t)((svfs.f_blocks - svfs.f_bfree) * bsize);
+        disk["free"]  = (int64_t)(svfs.f_bavail * bsize);
+    } else {
+        disk["total"] = 6700000000LL;
+        disk["used"]  = 1200000000LL;
+        disk["free"]  = 5000000000LL;
+    }
+
+    json result;
+    result["dirs"]       = dirs;
+    result["files"]      = files;
+    result["disk_usage"] = disk;
+    result["root_info"]  = {{"name", root_name}, {"permissions", permissions}};
+    return result;
+}
+
+// Flat list of files under a root (for /server/files/list)
+static json list_files_flat(const std::string& dir_path,
+                             const std::string& prefix = "") {
+    json arr = json::array();
+    DIR* d = opendir(dir_path.c_str());
+    if (!d) return arr;
+    struct dirent* ent;
+    while ((ent = readdir(d)) != nullptr) {
+        std::string name = ent->d_name;
+        if (name == "." || name == "..") continue;
+        std::string full = dir_path + "/" + name;
+        struct stat st;
+        if (stat(full.c_str(), &st) != 0) continue;
+        std::string rel = prefix.empty() ? name : prefix + "/" + name;
+        if (S_ISDIR(st.st_mode)) {
+            // Recurse into subdirectory
+            json sub = list_files_flat(full, rel);
+            for (auto& item : sub) arr.push_back(item);
+        } else if (S_ISREG(st.st_mode)) {
+            json f = file_to_json(rel, full);
+            f["path"] = rel; // flat listing uses "path" not "filename"
+            f.erase("filename");
+            arr.push_back(f);
+        }
+    }
+    closedir(d);
+    return arr;
+}
 
 // ── Moonraker → CC2 method translation ────────────────────────────────────
 static std::string moonraker_to_cc2(const std::string& method) {
@@ -79,7 +193,9 @@ void BridgeServer::start_subscription() {
         {"gcode_move",      nullptr},
         {"virtual_sdcard",  nullptr},
         {"idle_timeout",    nullptr},
-        {"webhooks",        nullptr}
+        {"webhooks",        nullptr},
+        {"configfile",      nullptr},
+        {"display_status",  nullptr}
     };
     params["response_template"] = json::object();
 
@@ -394,27 +510,191 @@ void BridgeServer::setup_http_routes(hv::HttpService& svc) {
         return 200;
     });
 
-    // /server/files/list?root=gcodes  — return empty list (no files uploaded yet)
-    svc.GET("/server/files/list", [](HttpRequest*, HttpResponse* resp) -> int {
+    // /server/files/list?root=gcodes  — list files in root from filesystem
+    svc.GET("/server/files/list", [](HttpRequest* req, HttpResponse* resp) -> int {
+        std::string root = req->GetParam("root");
+        if (root.empty()) root = "gcodes";
+        std::string dir = root_to_path(root);
+        json arr = dir.empty() ? json::array() : list_files_flat(dir);
+        json out; out["result"] = arr;
         resp->content_type = APPLICATION_JSON;
-        resp->body = "{\"result\":[]}";
+        resp->body = out.dump();
         return 200;
     });
 
-    // /server/files/get_directory?path=config  — return empty directory object.
-    // Mainsail's Config Files panel calls this via HTTP (not WS) to list the
-    // config root. Without this, the /server/files/* wildcard returns a 404
-    // and Mainsail shows "No configuration directory found".
+    // /server/files/get_directory?path=config  — return actual directory listing.
+    // Mainsail's Config Files panel calls this via HTTP to list the config root.
     svc.GET("/server/files/get_directory", [](HttpRequest* req, HttpResponse* resp) -> int {
         std::string path = req->GetParam("path");
         std::cerr << "[http] GET /server/files/get_directory path=" << path << "\n";
+        // path can be "gcodes", "config", or "gcodes/subdir"
+        std::string root_name = path.empty() ? "gcodes" : path.substr(0, path.find('/'));
+        std::string root_dir  = root_to_path(root_name);
+        std::string sub_path  = (path.find('/') != std::string::npos)
+                                    ? path.substr(path.find('/') + 1) : "";
+        std::string full_dir  = root_dir.empty() ? "" :
+                                (sub_path.empty() ? root_dir : root_dir + "/" + sub_path);
+        json r = full_dir.empty() ? json({{"dirs", json::array()}, {"files", json::array()},
+                                          {"disk_usage", {{"total",0},{"used",0},{"free",0}}},
+                                          {"root_info",  {{"name", root_name},{"permissions","rw"}}}})
+                                  : read_directory(full_dir, root_name);
+        json out; out["result"] = r;
+        resp->content_type = APPLICATION_JSON;
+        resp->body = out.dump();
+        return 200;
+    });
+
+    // ── File upload: POST /server/files/upload ────────────────────────────
+    // multipart/form-data; fields: file (the file), root, path
+    svc.POST("/server/files/upload", [this](HttpRequest* req, HttpResponse* resp) -> int {
+        // libhv puts multipart files in req->form
+        std::string root = req->GetParam("root");
+        if (root.empty()) root = "gcodes";
+        std::string dest_dir = root_to_path(root);
+        std::string path = req->GetParam("path");
+        if (!path.empty()) dest_dir += "/" + path;
+
+        resp->content_type = APPLICATION_JSON;
+        if (dest_dir.empty()) {
+            resp->body = "{\"error\":{\"message\":\"Unknown root\",\"code\":400}}";
+            return 400;
+        }
+
+        // Check if a file part was submitted
+        auto it = req->form.find("file");
+        if (it == req->form.end()) {
+            resp->body = "{\"error\":{\"message\":\"No file in upload\",\"code\":400}}";
+            return 400;
+        }
+
+        const auto& fp = it->second;
+        std::string filename = fp.filename.empty() ? "upload.gcode" : fp.filename;
+        // Sanitize filename (no path traversal)
+        auto slash = filename.rfind('/');
+        if (slash != std::string::npos) filename = filename.substr(slash + 1);
+
+        std::string out_path = dest_dir + "/" + filename;
+        std::ofstream ofs(out_path, std::ios::binary);
+        if (!ofs) {
+            resp->body = "{\"error\":{\"message\":\"Cannot write file\",\"code\":500}}";
+            return 500;
+        }
+        ofs.write(fp.content.data(), fp.content.size());
+        ofs.close();
+
+        std::string rel = path.empty() ? filename : path + "/" + filename;
+        json item = file_to_json(rel, out_path);
+        item["path"] = rel;
+        item.erase("filename");
+        json out; out["result"] = {{"item", item}, {"print_started", false}, {"action", "create"}};
+        resp->body = out.dump();
+        std::cerr << "[http] POST /server/files/upload -> " << out_path << "\n";
+        return 201;
+    });
+
+    // ── History HTTP endpoints ────────────────────────────────────────────
+    svc.GET("/server/history/list", [](HttpRequest*, HttpResponse* resp) -> int {
         json r;
-        r["dirs"]  = json::array();
-        r["files"] = json::array();
-        r["disk_usage"] = {{"total", 6700000000LL}, {"used", 1200000000LL}, {"free", 5000000000LL}};
-        // Use the requested root name (or "config" as fallback) for root_info
-        std::string root_name = path.empty() ? "config" : path.substr(0, path.find('/'));
-        r["root_info"] = {{"name", root_name}, {"permissions", "rw"}};
+        r["count"]         = 0;
+        r["jobs"]          = json::array();
+        r["all_jobs_flag"] = false;
+        json out; out["result"] = r;
+        resp->content_type = APPLICATION_JSON;
+        resp->body = out.dump();
+        return 200;
+    });
+    svc.GET("/server/history/totals", [](HttpRequest*, HttpResponse* resp) -> int {
+        json r;
+        r["job_totals"] = {
+            {"total_jobs", 0}, {"total_time", 0.0},
+            {"total_print_time", 0.0}, {"total_filament_used", 0.0},
+            {"longest_job", 0.0}, {"longest_print", 0.0}
+        };
+        json out; out["result"] = r;
+        resp->content_type = APPLICATION_JSON;
+        resp->body = out.dump();
+        return 200;
+    });
+    svc.Handle("DELETE", "/server/history/job", [](HttpRequest*, HttpResponse* resp) -> int {
+        json out; out["result"] = {{"deleted_jobs", json::array()}};
+        resp->content_type = APPLICATION_JSON;
+        resp->body = out.dump();
+        return 200;
+    });
+
+    // ── Job Queue HTTP endpoints ──────────────────────────────────────────
+    svc.GET("/server/job_queue/status", [this](HttpRequest*, HttpResponse* resp) -> int {
+        std::lock_guard<std::mutex> lock(jq_mutex);
+        json r;
+        r["queued_jobs"]  = job_queue;
+        r["queue_state"]  = queue_state;
+        json out; out["result"] = r;
+        resp->content_type = APPLICATION_JSON;
+        resp->body = out.dump();
+        return 200;
+    });
+    svc.POST("/server/job_queue/job", [this](HttpRequest* req, HttpResponse* resp) -> int {
+        json body;
+        try { body = json::parse(req->body); } catch (...) {}
+        std::string filename = body.value("filename", req->GetParam("filename"));
+        resp->content_type = APPLICATION_JSON;
+        if (filename.empty()) {
+            resp->body = "{\"error\":{\"message\":\"filename required\",\"code\":400}}"; return 400;
+        }
+        std::lock_guard<std::mutex> lock(jq_mutex);
+        json job;
+        job["job_id"]        = "job_" + std::to_string(jq_id_counter++);
+        job["filename"]      = filename;
+        job["time_added"]    = (double)time(nullptr);
+        job["time_in_queue"] = 0.0;
+        job_queue.push_back(job);
+        json r; r["queued_jobs"] = job_queue; r["queue_state"] = queue_state;
+        json out; out["result"] = r;
+        resp->body = out.dump();
+        return 200;
+    });
+    svc.Handle("DELETE", "/server/job_queue/job", [this](HttpRequest* req, HttpResponse* resp) -> int {
+        // job_ids can be ?job_ids=id1,id2 or JSON body
+        std::string ids_param = req->GetParam("job_ids");
+        std::set<std::string> to_remove;
+        // parse comma-separated or JSON array
+        if (!ids_param.empty()) {
+            std::istringstream ss(ids_param);
+            std::string tok;
+            while (std::getline(ss, tok, ',')) to_remove.insert(tok);
+        } else {
+            json body;
+            try { body = json::parse(req->body); } catch (...) {}
+            if (body.contains("job_ids") && body["job_ids"].is_array())
+                for (auto& jid : body["job_ids"]) to_remove.insert(jid.get<std::string>());
+        }
+        std::lock_guard<std::mutex> lock(jq_mutex);
+        std::vector<json> remaining;
+        json deleted = json::array();
+        for (auto& job : job_queue) {
+            if (to_remove.count(job["job_id"].get<std::string>())) deleted.push_back(job["job_id"]);
+            else remaining.push_back(job);
+        }
+        job_queue = remaining;
+        json r; r["deleted_jobs"] = deleted; r["queued_jobs"] = job_queue; r["queue_state"] = queue_state;
+        json out; out["result"] = r;
+        resp->content_type = APPLICATION_JSON;
+        resp->body = out.dump();
+        return 200;
+    });
+    svc.POST("/server/job_queue/start", [this](HttpRequest*, HttpResponse* resp) -> int {
+        std::lock_guard<std::mutex> lock(jq_mutex);
+        queue_state = "loading";
+        json r; r["queued_jobs"] = job_queue; r["queue_state"] = queue_state;
+        json out; out["result"] = r;
+        resp->content_type = APPLICATION_JSON;
+        resp->body = out.dump();
+        return 200;
+    });
+    svc.POST("/server/job_queue/pause", [this](HttpRequest*, HttpResponse* resp) -> int {
+        std::lock_guard<std::mutex> lock(jq_mutex);
+        queue_state = (queue_state == "paused") ? "ready" : "paused";
+        json r; r["queued_jobs"] = job_queue; r["queue_state"] = queue_state;
         json out; out["result"] = r;
         resp->content_type = APPLICATION_JSON;
         resp->body = out.dump();
@@ -447,9 +727,84 @@ void BridgeServer::setup_http_routes(hv::HttpService& svc) {
         return serve_log("/home/eeb001/printer_data/logs/elegoo.log", resp);
     });
 
-    svc.GET("/server/files/*",       json_404);
+    // GET /server/files/{root}/{path...}  — serve actual file
+    svc.GET("/server/files/*", [](HttpRequest* req, HttpResponse* resp) -> int {
+        // path format: /server/files/{root}/{relative}
+        std::string p = req->path;
+        // Strip /server/files/ prefix
+        if (p.size() > 15) p = p.substr(15); // strlen("/server/files/") = 15
+        auto slash = p.find('/');
+        if (slash == std::string::npos) {
+            // Just a root name — shouldn't happen after specific handlers, 404 it
+            resp->content_type = APPLICATION_JSON;
+            resp->body = "{\"error\":{\"message\":\"Not Found\",\"code\":404}}";
+            std::cerr << "[http] 404 " << req->path << "\n";
+            return 404;
+        }
+        std::string root    = p.substr(0, slash);
+        std::string relpath = p.substr(slash + 1);
+        std::string dir     = root_to_path(root);
+        if (dir.empty() || relpath.empty()) {
+            resp->content_type = APPLICATION_JSON;
+            resp->body = "{\"error\":{\"message\":\"Not Found\",\"code\":404}}";
+            std::cerr << "[http] 404 " << req->path << "\n";
+            return 404;
+        }
+        std::string full = dir + "/" + relpath;
+        // Guard against path traversal
+        if (full.find("..") != std::string::npos) {
+            resp->content_type = APPLICATION_JSON;
+            resp->body = "{\"error\":{\"message\":\"Forbidden\",\"code\":403}}";
+            return 403;
+        }
+        std::ifstream ifs(full, std::ios::binary);
+        if (!ifs.good()) {
+            resp->content_type = APPLICATION_JSON;
+            resp->body = "{\"error\":{\"message\":\"Not Found\",\"code\":404}}";
+            std::cerr << "[http] 404 " << req->path << "\n";
+            return 404;
+        }
+        std::ostringstream ss; ss << ifs.rdbuf();
+        resp->body = ss.str();
+        // Determine content type by extension
+        std::string ext;
+        auto dot = relpath.rfind('.');
+        if (dot != std::string::npos) ext = relpath.substr(dot + 1);
+        if (ext == "gcode" || ext == "g" || ext == "gc" || ext == "txt" || ext == "cfg" || ext == "log")
+            resp->SetHeader("Content-Type", "text/plain");
+        else if (ext == "json")
+            resp->content_type = APPLICATION_JSON;
+        else
+            resp->SetHeader("Content-Type", "application/octet-stream");
+        resp->SetHeader("Content-Disposition",
+                        "attachment; filename=\"" + relpath.substr(relpath.rfind('/') + 1) + "\"");
+        return 200;
+    });
     svc.POST("/server/files/*",      json_404);
-    svc.Handle("DELETE", "/server/files/*", json_404);
+    // DELETE /server/files/{root}/{path...}  — delete file
+    svc.Handle("DELETE", "/server/files/*", [](HttpRequest* req, HttpResponse* resp) -> int {
+        std::string p = req->path;
+        if (p.size() > 15) p = p.substr(15);
+        auto slash = p.find('/');
+        resp->content_type = APPLICATION_JSON;
+        if (slash == std::string::npos) {
+            resp->body = "{\"error\":{\"message\":\"Not Found\",\"code\":404}}"; return 404;
+        }
+        std::string root    = p.substr(0, slash);
+        std::string relpath = p.substr(slash + 1);
+        std::string dir     = root_to_path(root);
+        if (dir.empty() || relpath.empty() || relpath.find("..") != std::string::npos) {
+            resp->body = "{\"error\":{\"message\":\"Forbidden\",\"code\":403}}"; return 403;
+        }
+        std::string full = dir + "/" + relpath;
+        bool ok = (remove(full.c_str()) == 0);
+        if (!ok) {
+            resp->body = "{\"error\":{\"message\":\"Delete failed\",\"code\":500}}"; return 500;
+        }
+        json out; out["result"] = {{"item", {{"path", relpath}}}, {"action", "delete"}};
+        resp->body = out.dump();
+        return 200;
+    });
     svc.GET("/server/history/*",     json_404);
     svc.GET("/server/webcams/*",     json_404);
     svc.GET("/server/temperature_store", [](HttpRequest*, HttpResponse* resp) -> int {
@@ -790,11 +1145,80 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
     }
 
     if (method == "server.files.get_directory") {
-        json r;
-        r["dirs"]  = json::array();
-        r["files"] = json::array();
-        r["disk_usage"] = {{"total", 6700000000}, {"used", 1200000000}, {"free", 5000000000}};
+        std::string path = params.value("path", "");
+        std::string root_name = path.empty() ? "gcodes" : path.substr(0, path.find('/'));
+        std::string root_dir  = root_to_path(root_name);
+        std::string sub_path  = (path.find('/') != std::string::npos)
+                                    ? path.substr(path.find('/') + 1) : "";
+        std::string full_dir  = root_dir.empty() ? "" :
+                                (sub_path.empty() ? root_dir : root_dir + "/" + sub_path);
+        json r = full_dir.empty()
+            ? json({{"dirs", json::array()}, {"files", json::array()},
+                    {"disk_usage", {{"total",0},{"used",0},{"free",0}}},
+                    {"root_info",  {{"name", root_name}, {"permissions", "rw"}}}})
+            : read_directory(full_dir, root_name);
         send_response(r);
+        return;
+    }
+
+    if (method == "server.files.list") {
+        std::string root = params.value("root", "gcodes");
+        std::string dir  = root_to_path(root);
+        json arr = dir.empty() ? json::array() : list_files_flat(dir);
+        send_response(arr);
+        return;
+    }
+
+    // ── Job queue WS methods ──────────────────────────────────────────────
+    if (method == "server.job_queue.status") {
+        std::lock_guard<std::mutex> lock(jq_mutex);
+        json r; r["queued_jobs"] = job_queue; r["queue_state"] = queue_state;
+        send_response(r);
+        return;
+    }
+    if (method == "server.job_queue.post_job") {
+        std::string filename = params.value("filename", "");
+        if (filename.empty()) { send_error("filename required"); return; }
+        std::lock_guard<std::mutex> lock(jq_mutex);
+        json job;
+        job["job_id"]        = "job_" + std::to_string(jq_id_counter++);
+        job["filename"]      = filename;
+        job["time_added"]    = (double)time(nullptr);
+        job["time_in_queue"] = 0.0;
+        job_queue.push_back(job);
+        json r; r["queued_jobs"] = job_queue; r["queue_state"] = queue_state;
+        send_response(r);
+        return;
+    }
+    if (method == "server.job_queue.delete_job") {
+        json ids = params.value("job_ids", json::array());
+        std::set<std::string> to_remove;
+        if (ids.is_array()) for (auto& jid : ids) to_remove.insert(jid.get<std::string>());
+        std::lock_guard<std::mutex> lock(jq_mutex);
+        std::vector<json> remaining;
+        for (auto& job : job_queue)
+            if (!to_remove.count(job["job_id"].get<std::string>())) remaining.push_back(job);
+        job_queue = remaining;
+        json r; r["queued_jobs"] = job_queue; r["queue_state"] = queue_state;
+        send_response(r);
+        return;
+    }
+    if (method == "server.job_queue.start") {
+        std::lock_guard<std::mutex> lock(jq_mutex);
+        queue_state = "loading";
+        json r; r["queued_jobs"] = job_queue; r["queue_state"] = queue_state;
+        send_response(r);
+        return;
+    }
+    if (method == "server.job_queue.pause") {
+        std::lock_guard<std::mutex> lock(jq_mutex);
+        queue_state = (queue_state == "paused") ? "ready" : "paused";
+        json r; r["queued_jobs"] = job_queue; r["queue_state"] = queue_state;
+        send_response(r);
+        return;
+    }
+    if (method == "server.job_queue.jump") {
+        send_response(json::object());
         return;
     }
 
@@ -843,15 +1267,45 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
         }
     }
 
-    // For query/subscribe: fill in empty objects for any requested items
-    // that CC2 didn't include in the status response.
+    // For query/subscribe: fill in well-typed stubs for any requested objects
+    // that CC2 didn't include, including virtual Mainsail objects.
     if ((method == "printer.objects.query" || method == "printer.objects.subscribe") &&
         result.contains("status") &&
         params.contains("objects") && params["objects"].is_object()) {
         auto& status = result["status"];
         for (auto it = params["objects"].begin(); it != params["objects"].end(); ++it) {
-            if (!status.contains(it.key()))
-                status[it.key()] = json::object();
+            const std::string& key = it.key();
+            if (status.contains(key)) continue;
+
+            // Provide proper default status values for known virtual objects
+            if (key == "display_status") {
+                status[key] = {{"progress", 0.0}, {"message", ""}};
+            } else if (key == "gcode_macro pause" ||
+                       key == "gcode_macro resume" ||
+                       key == "gcode_macro cancel_print" ||
+                       key.substr(0, 11) == "gcode_macro") {
+                status[key] = {{"variables", json::object()}};
+            } else if (key == "configfile") {
+                // Inject synthetic configfile.config so Mainsail macro checks pass.
+                // Without these sections Mainsail shows "PAUSE macro not found in config".
+                json cfg_config = json::object();
+                cfg_config["gcode_macro pause"]        = {{"gcode", ""}, {"description", "Pause print"}};
+                cfg_config["gcode_macro resume"]       = {{"gcode", ""}, {"description", "Resume print"}};
+                cfg_config["gcode_macro cancel_print"] = {{"gcode", ""}, {"description", "Cancel print"}};
+                cfg_config["display_status"]           = json::object();
+                // Merge in real config sections if CC2 already provided them
+                if (status.contains("configfile") && status["configfile"].contains("config")) {
+                    for (auto sit = status["configfile"]["config"].begin();
+                         sit != status["configfile"]["config"].end(); ++sit) {
+                        cfg_config[sit.key()] = sit.value();
+                    }
+                }
+                status[key]["config"]   = cfg_config;
+                status[key]["settings"] = json::object();
+                status[key]["save_config_pending"] = false;
+            } else {
+                status[key] = json::object();
+            }
         }
     }
 
