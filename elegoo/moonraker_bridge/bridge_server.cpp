@@ -19,7 +19,7 @@
 // ── Filesystem helpers ─────────────────────────────────────────────────────
 static const std::string GCODE_ROOT  = "/opt/usr/gcode";
 static const std::string CONFIG_ROOT = "/opt/usr/config";
-static const std::string LOGS_ROOT   = "/home/eeb001/printer_data/logs";
+static const std::string LOGS_ROOT   = "/opt/usr/logs";
 
 static std::string root_to_path(const std::string& root) {
     if (root == "gcodes") return GCODE_ROOT;
@@ -174,6 +174,27 @@ BridgeServer::~BridgeServer() {
 }
 
 void BridgeServer::start() {
+    // Ensure config and gcode roots exist so Mainsail can list them
+    ::mkdir(CONFIG_ROOT.c_str(), 0755);
+    ::mkdir(GCODE_ROOT.c_str(),  0755);
+
+    // Create a minimal printer.cfg if none exists — prevents Mainsail
+    // from showing "No configuration directory found" when the config
+    // panel is opened for the first time.
+    std::string cfg_path = CONFIG_ROOT + "/printer.cfg";
+    {
+        struct stat st;
+        if (stat(cfg_path.c_str(), &st) != 0) {
+            std::ofstream f(cfg_path);
+            if (f) {
+                f << "# Elegoo CC2 — managed by moonraker_bridge\n"
+                  << "# This file exists so Mainsail's Config Files panel\n"
+                  << "# does not show 'No configuration directory found'.\n";
+                std::cerr << "[bridge] Created placeholder " << cfg_path << "\n";
+            }
+        }
+    }
+
     server.setPort(port);
     server.setThreadNum(4);
     server.start();
@@ -251,39 +272,73 @@ void BridgeServer::start_subscription() {
 
 // ── Broadcast CC2 update → all WS clients ─────────────────────────────────
 void BridgeServer::broadcast_update(const json& cc2_update) {
+    // Debug: log raw CC2 push messages so we can see actual field layout
+    std::cerr << "[cc2_push] " << cc2_update.dump() << "\n";
+
     // CC2 update format: {"id":0,"params":{"eventtime":N,"status":{...}}}
     // Moonraker expects: {"jsonrpc":"2.0","method":"notify_status_update",
     //                     "params":[{"eventtime":N,"status":{...}}]}
-    json notify;
-    notify["jsonrpc"] = "2.0";
 
-    // If CC2 already uses Moonraker's method name (e.g. notify_gcode_response),
-    // forward it as-is.  Otherwise wrap as notify_status_update.
+    // ── Case 1: CC2 already names the method (e.g. notify_gcode_response) ──
     if (cc2_update.contains("method") && cc2_update["method"].is_string()) {
-        notify["method"] = cc2_update["method"];
-        notify["params"] = cc2_update.value("params", json::array());
-    } else if (cc2_update.contains("params") && cc2_update["params"].is_object() &&
-               cc2_update["params"].contains("gcode_response")) {
-        // CC2 wraps gcode output as params.gcode_response
-        notify["method"] = "notify_gcode_response";
-        notify["params"] = json::array({cc2_update["params"]["gcode_response"]});
-    } else {
-        // Standard status update
-        notify["method"] = "notify_status_update";
+        json notify;
+        notify["jsonrpc"] = "2.0";
+        notify["method"]  = cc2_update["method"];
+        notify["params"]  = cc2_update.value("params", json::array());
+        std::string payload = notify.dump();
+        std::lock_guard<std::mutex> lock(ws_clients_mutex);
+        for (auto& ch : ws_clients)
+            if (ch && ch->isConnected()) ch->send(payload);
+        return;
+    }
+
+    // ── Case 2: CC2 puts gcode_response at params.gcode_response ───────────
+    if (cc2_update.contains("params") && cc2_update["params"].is_object() &&
+        cc2_update["params"].contains("gcode_response")) {
+        broadcast_gcode_response(
+            cc2_update["params"]["gcode_response"].get<std::string>());
+        return;
+    }
+
+    // ── Case 3: CC2 status update that also embeds a gcode_response ─────────
+    // Some CC2 versions include gcode_response inside the status sub-object.
+    if (cc2_update.contains("params") && cc2_update["params"].is_object()) {
+        const json& p = cc2_update["params"];
+        if (p.contains("status") && p["status"].is_object() &&
+            p["status"].contains("gcode_response") &&
+            p["status"]["gcode_response"].is_string()) {
+            broadcast_gcode_response(
+                p["status"]["gcode_response"].get<std::string>());
+            // Also forward the rest of the status update (gcode_response
+            // stripped so it doesn't confuse Mainsail's status store).
+            json stripped = cc2_update;
+            stripped["params"]["status"].erase("gcode_response");
+            json notify;
+            notify["jsonrpc"] = "2.0";
+            notify["method"]  = "notify_status_update";
+            notify["params"]  = json::array({stripped["params"]});
+            std::string payload = notify.dump();
+            std::lock_guard<std::mutex> lock(ws_clients_mutex);
+            for (auto& ch : ws_clients)
+                if (ch && ch->isConnected()) ch->send(payload);
+            return;
+        }
+    }
+
+    // ── Case 4: Standard status update ──────────────────────────────────────
+    {
+        json notify;
+        notify["jsonrpc"] = "2.0";
+        notify["method"]  = "notify_status_update";
         if (cc2_update.contains("params")) {
             notify["params"] = json::array({cc2_update["params"]});
         } else {
             notify["params"] = json::array({cc2_update});
         }
-    }
-
-    std::string payload = notify.dump();
-
-    std::lock_guard<std::mutex> lock(ws_clients_mutex);
-    for (auto& ch : ws_clients) {
-        if (ch && ch->isConnected()) {
-            ch->send(payload);
-        }
+        std::string payload = notify.dump();
+        std::lock_guard<std::mutex> lock(ws_clients_mutex);
+        for (auto& ch : ws_clients)
+            if (ch && ch->isConnected()) ch->send(payload);
     }
 }
 
