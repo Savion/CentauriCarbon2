@@ -19,7 +19,10 @@
 
 class BridgeServer {
 public:
-    BridgeServer(std::shared_ptr<CC2Client> client, int port = 7125);
+    // webroot: optional path to static web UI files (e.g. Mainsail dist/).
+    // If non-empty, GET / and unmatched routes serve files from that directory.
+    BridgeServer(std::shared_ptr<CC2Client> client, int port = 7125,
+                 const std::string& webroot = "");
     ~BridgeServer();
 
     // Start HTTP+WS server (non-blocking)
@@ -48,6 +51,7 @@ private:
 
     std::shared_ptr<CC2Client> client;
     int port;
+    std::string webroot;
     hv::HttpService  http_service;
     hv::WebSocketService ws_service;
     hv::WebSocketServer server;

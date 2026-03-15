@@ -34,9 +34,11 @@ static std::string moonraker_to_cc2(const std::string& method) {
 }
 
 // ── Constructor / Destructor ───────────────────────────────────────────────
-BridgeServer::BridgeServer(std::shared_ptr<CC2Client> client, int port)
+BridgeServer::BridgeServer(std::shared_ptr<CC2Client> client, int port,
+                           const std::string& webroot)
     : client(std::move(client))
     , port(port)
+    , webroot(webroot)
 {
     // WebSocketServer inherits HttpServer; register both services explicitly
     server.registerHttpService(&http_service);
@@ -275,6 +277,14 @@ void BridgeServer::setup_http_routes(hv::HttpService& svc) {
     svc.POST("/printer/firmware_restart", [this](HttpRequest*, HttpResponse* resp) -> int {
         return cc2_http("gcode/firmware_restart", json::object(), resp);
     });
+
+    // ── Static web UI (Mainsail / Fluidd) ────────────────────────────────
+    // Must be registered LAST so all API routes above take priority.
+    // Enable with -w /path/to/mainsail on the command line.
+    if (!webroot.empty()) {
+        svc.Static("/", webroot.c_str());
+        std::cerr << "[bridge] Serving web UI from: " << webroot << "\n";
+    }
 }
 
 // ── WebSocket service setup ────────────────────────────────────────────────
