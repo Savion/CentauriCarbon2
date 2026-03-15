@@ -354,6 +354,13 @@ void BridgeServer::setup_http_routes(hv::HttpService& svc) {
         std::cerr << "[http] 404 " << req->path << "\n";
         return 404;
     };
+    // /server/files/list?root=gcodes  — return empty list (no files uploaded yet)
+    svc.GET("/server/files/list", [](HttpRequest*, HttpResponse* resp) -> int {
+        resp->content_type = APPLICATION_JSON;
+        resp->body = "{\"result\":[]}";
+        return 200;
+    });
+
     svc.GET("/server/files/*",       json_404);
     svc.POST("/server/files/*",      json_404);
     svc.Handle("DELETE", "/server/files/*", json_404);
@@ -472,7 +479,16 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
     // Stub out server.* methods Mainsail polls during init
     if (method == "server.config") {
         json r;
-        r["config"] = json::object();
+        // Provide a file_manager config path so Mainsail doesn't show
+        // "No configuration directory found"
+        r["config"] = {
+            {"file_manager", {
+                {"config_path", "/opt/usr/config"},
+                {"log_path",    "/opt/usr/logs"},
+                {"queue_gcode_uploads", false},
+                {"enable_object_processing", false}
+            }}
+        };
         r["orig"] = json::object();
         send_response(r);
         return;
@@ -502,6 +518,11 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
         gcodes["path"]        = "/opt/usr/gcode";
         gcodes["permissions"] = "rw";
         r.push_back(gcodes);
+        json config;
+        config["name"]        = "config";
+        config["path"]        = "/opt/usr/config";
+        config["permissions"] = "r";
+        r.push_back(config);
         send_response(r);
         return;
     }
@@ -674,10 +695,37 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
             result["components"] = json::array({"webhooks", "extruder", "heaters"});
     }
 
-    // Special post-processing for printer.objects.subscribe:
-    // Moonraker expects {"eventtime":N,"status":{...}} in result
-    if (method == "printer.objects.subscribe" && result.contains("status")) {
-        // result is already in the right shape
+    // ── Inject virtual Mainsail-required objects ──────────────────────────
+    // Mainsail warns if these are absent; CC2 doesn't expose them as gcode
+    // macros, so we inject empty stubs so the UI stays quiet.
+    static const std::vector<std::string> MAINSAIL_VIRTUAL_OBJECTS = {
+        "display_status",
+        "gcode_macro pause",
+        "gcode_macro resume",
+        "gcode_macro cancel_print"
+    };
+
+    if (method == "printer.objects.list" &&
+        result.contains("objects") && result["objects"].is_array()) {
+        auto& objs = result["objects"];
+        for (const auto& vobj : MAINSAIL_VIRTUAL_OBJECTS) {
+            bool found = false;
+            for (const auto& o : objs)
+                if (o.get<std::string>() == vobj) { found = true; break; }
+            if (!found) objs.push_back(vobj);
+        }
+    }
+
+    // For query/subscribe: fill in empty objects for any requested items
+    // that CC2 didn't include in the status response.
+    if ((method == "printer.objects.query" || method == "printer.objects.subscribe") &&
+        result.contains("status") &&
+        params.contains("objects") && params["objects"].is_object()) {
+        auto& status = result["status"];
+        for (auto it = params["objects"].begin(); it != params["objects"].end(); ++it) {
+            if (!status.contains(it.key()))
+                status[it.key()] = json::object();
+        }
     }
 
     send_response(result);
