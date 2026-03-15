@@ -453,6 +453,10 @@ void BridgeServer::setup_http_routes(hv::HttpService& svc) {
             resp->body = e.dump(); return 500;
         }
         json r = cc2["result"];
+        // Always force "ready" — CC2 may transiently report "startup" and that
+        // would send Mainsail straight into a 2-second reinitializing loop.
+        r["state"]         = "ready";
+        r["state_message"] = "Printer is ready";
         // Add Klipper-style fields OrcaSlicer expects
         if (!r.contains("klipper_path"))
             r["klipper_path"] = r.value("elegoo_path", "/home/eeb001/elegoo");
@@ -1681,9 +1685,10 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
 
     // Special post-processing for printer.info
     if (method == "printer.info") {
-        // Always inject "ready" so Mainsail doesn't show "reinitializing"
-        if (!result.contains("state"))         result["state"]         = "ready";
-        if (!result.contains("state_message")) result["state_message"] = "Printer is ready";
+        // ALWAYS force "ready" — CC2 may transiently return "startup" during
+        // reconnects, which would send Mainsail into a 2-second polling loop.
+        result["state"]         = "ready";
+        result["state_message"] = "Printer is ready";
         if (!result.contains("klipper_path"))
             result["klipper_path"] = result.value("elegoo_path", "/home/eeb001/elegoo");
         if (!result.contains("components"))
@@ -1758,6 +1763,15 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
                 status[key] = json::object();
             }
         }
+    }
+
+    // Unconditionally ensure webhooks.state="ready" in status responses.
+    // The loop above only fires when params.objects is an explicit object; if
+    // Mainsail sends null (query-all) or doesn't list webhooks we still need it.
+    if ((method == "printer.objects.query" || method == "printer.objects.subscribe") &&
+        result.contains("status")) {
+        result["status"]["webhooks"]["state"]         = "ready";
+        result["status"]["webhooks"]["state_message"] = "Printer is ready";
     }
 
     // Mainsail expects eventtime in subscribe/query results.

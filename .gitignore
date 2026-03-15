@@ -1,0 +1,13 @@
+# Build output directories
+elegoo/build/
+elegoo/moonraker_bridge_build/
+build/
+
+# Compiled object/library files
+*.o
+*.a
+*.so
+*.elf
+
+# Claude Code local settings (machine-specific, not for sharing)
+.claude/
