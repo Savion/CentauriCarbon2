@@ -361,6 +361,22 @@ void BridgeServer::setup_http_routes(hv::HttpService& svc) {
         return 200;
     });
 
+    // /server/files/get_directory?path=config  — return empty directory object
+    // Mainsail's Config Files panel calls this via HTTP (not WS) to list the
+    // config root. Without this, the /server/files/* wildcard returns a 404
+    // and Mainsail shows "No configuration directory found".
+    svc.GET("/server/files/get_directory", [](HttpRequest*, HttpResponse* resp) -> int {
+        json r;
+        r["dirs"]  = json::array();
+        r["files"] = json::array();
+        r["disk_usage"] = {{"total", 6700000000LL}, {"used", 1200000000LL}, {"free", 5000000000LL}};
+        r["root_info"] = {{"name", "config"}, {"permissions", "r"}};
+        json out; out["result"] = r;
+        resp->content_type = APPLICATION_JSON;
+        resp->body = out.dump();
+        return 200;
+    });
+
     svc.GET("/server/files/*",       json_404);
     svc.POST("/server/files/*",      json_404);
     svc.Handle("DELETE", "/server/files/*", json_404);
