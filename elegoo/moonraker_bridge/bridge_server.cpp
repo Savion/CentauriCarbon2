@@ -9,6 +9,7 @@
 #include <thread>
 #include <chrono>
 #include <algorithm>
+#include <iomanip>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -20,6 +21,9 @@
 static const std::string GCODE_ROOT  = "/opt/usr/gcode";
 static const std::string CONFIG_ROOT = "/opt/usr/config";
 static const std::string LOGS_ROOT   = "/opt/usr/logs";
+// Persistence files (stored inside CONFIG_ROOT so they survive bridge restarts)
+static const std::string WEBCAM_FILE = CONFIG_ROOT + "/.webcams.json";
+static const std::string DB_FILE     = CONFIG_ROOT + "/.moonraker_db.json";
 
 static std::string root_to_path(const std::string& root) {
     if (root == "gcodes") return GCODE_ROOT;
@@ -174,9 +178,10 @@ BridgeServer::~BridgeServer() {
 }
 
 void BridgeServer::start() {
-    // Ensure config and gcode roots exist so Mainsail can list them
+    // Ensure config, gcode, and logs roots exist so Mainsail can list them
     ::mkdir(CONFIG_ROOT.c_str(), 0755);
     ::mkdir(GCODE_ROOT.c_str(),  0755);
+    ::mkdir(LOGS_ROOT.c_str(),   0755);
 
     // Create a minimal printer.cfg if none exists — prevents Mainsail
     // from showing "No configuration directory found" when the config
@@ -194,6 +199,24 @@ void BridgeServer::start() {
             }
         }
     }
+
+    // Create stub log files so Mainsail's Log Files panel finds them.
+    // To get real logs: run elegoo_printer ... 2>/opt/usr/logs/klippy.log
+    auto stub_log = [](const std::string& path) {
+        struct stat st;
+        if (stat(path.c_str(), &st) != 0) {
+            std::ofstream f(path);
+            if (f) f << "[moonraker_bridge] Log stub.\n"
+                       "Redirect elegoo_printer stderr here for real content:\n"
+                       "  elegoo_printer <args> 2>" << path << "\n";
+        }
+    };
+    stub_log(LOGS_ROOT + "/klippy.log");
+    stub_log(LOGS_ROOT + "/moonraker.log");
+
+    // Load persisted webcam configs and database
+    load_webcams();
+    load_db();
 
     server.setPort(port);
     server.setThreadNum(4);
@@ -231,6 +254,49 @@ void BridgeServer::start_proc_stat_broadcast() {
 
 void BridgeServer::stop() {
     server.stop();
+}
+
+// ── Persistence helpers ────────────────────────────────────────────────────
+void BridgeServer::load_webcams() {
+    std::ifstream ifs(WEBCAM_FILE);
+    if (!ifs.good()) return;
+    try {
+        json data = json::parse(ifs);
+        std::lock_guard<std::mutex> lock(webcam_mutex);
+        if (data.is_object())
+            for (auto it = data.begin(); it != data.end(); ++it)
+                webcam_store[it.key()] = it.value();
+        std::cerr << "[bridge] Loaded " << webcam_store.size() << " webcam(s)\n";
+    } catch (...) {}
+}
+
+void BridgeServer::save_webcams() {
+    // Caller must hold webcam_mutex
+    json data = json::object();
+    for (auto& kv : webcam_store) data[kv.first] = kv.second;
+    std::ofstream ofs(WEBCAM_FILE);
+    if (ofs) ofs << data.dump(2);
+}
+
+void BridgeServer::load_db() {
+    std::ifstream ifs(DB_FILE);
+    if (!ifs.good()) return;
+    try {
+        json data = json::parse(ifs);
+        std::lock_guard<std::mutex> lock(db_mutex);
+        if (data.is_object())
+            for (auto it = data.begin(); it != data.end(); ++it)
+                db_store[it.key()] = it.value();
+        std::cerr << "[bridge] Loaded " << db_store.size() << " db entries\n";
+    } catch (...) {}
+}
+
+void BridgeServer::save_db() {
+    // Caller must hold db_mutex
+    json data = json::object();
+    for (auto& kv : db_store) data[kv.first] = kv.second;
+    std::ofstream ofs(DB_FILE);
+    if (ofs) ofs << data.dump(2);
 }
 
 // ── CC2 subscription setup ─────────────────────────────────────────────────
@@ -572,6 +638,7 @@ void BridgeServer::setup_http_routes(hv::HttpService& svc) {
         {
             std::lock_guard<std::mutex> lock(db_mutex);
             db_store[db_key] = value;
+            save_db();
         }
         json r; r["namespace"] = ns; r["key"] = key; r["value"] = value;
         json out; out["result"] = r;
@@ -587,6 +654,7 @@ void BridgeServer::setup_http_routes(hv::HttpService& svc) {
         {
             std::lock_guard<std::mutex> lock(db_mutex);
             db_store.erase(db_key);
+            save_db();
         }
         resp->content_type = APPLICATION_JSON;
         resp->body = "{\"result\":{}}";
@@ -632,6 +700,11 @@ void BridgeServer::setup_http_routes(hv::HttpService& svc) {
         config["path"]        = "/opt/usr/config";
         config["permissions"] = "rw";
         r.push_back(config);
+        json logs;
+        logs["name"]        = "logs";
+        logs["path"]        = "/opt/usr/logs";
+        logs["permissions"] = "r";
+        r.push_back(logs);
         json out; out["result"] = r;
         resp->content_type = APPLICATION_JSON;
         resp->body = out.dump();
@@ -906,14 +979,17 @@ void BridgeServer::setup_http_routes(hv::HttpService& svc) {
         return 200;
     };
     svc.GET("/server/files/logs/klippy.log", [serve_log](HttpRequest*, HttpResponse* resp) -> int {
-        return serve_log(LOGS_ROOT + "/elegoo.log", resp);
+        return serve_log(LOGS_ROOT + "/klippy.log", resp);
     });
     svc.GET("/server/files/logs/moonraker.log", [serve_log](HttpRequest*, HttpResponse* resp) -> int {
-        return serve_log(LOGS_ROOT + "/elegoo.log", resp);
+        return serve_log(LOGS_ROOT + "/moonraker.log", resp);
     });
-    // Flat path fallback (some Mainsail versions request without root prefix)
+    // Flat path fallbacks (some Mainsail versions omit the "logs/" root prefix)
     svc.GET("/server/files/klippy.log", [serve_log](HttpRequest*, HttpResponse* resp) -> int {
-        return serve_log(LOGS_ROOT + "/elegoo.log", resp);
+        return serve_log(LOGS_ROOT + "/klippy.log", resp);
+    });
+    svc.GET("/server/files/moonraker.log", [serve_log](HttpRequest*, HttpResponse* resp) -> int {
+        return serve_log(LOGS_ROOT + "/moonraker.log", resp);
     });
 
     // GET /server/files/{root}/{path...}  — serve actual file
@@ -994,8 +1070,47 @@ void BridgeServer::setup_http_routes(hv::HttpService& svc) {
         resp->body = out.dump();
         return 200;
     });
-    svc.GET("/server/history/*",     json_404);
-    svc.GET("/server/webcams/*",     json_404);
+    svc.GET("/server/history/*", json_404);
+
+    // ── Webcam HTTP endpoints ────────────────────────────────────────────
+    svc.GET("/server/webcams/list", [this](HttpRequest*, HttpResponse* resp) -> int {
+        std::lock_guard<std::mutex> lock(webcam_mutex);
+        json r; r["webcams"] = json::array();
+        for (auto& kv : webcam_store) r["webcams"].push_back(kv.second);
+        json out; out["result"] = r;
+        resp->content_type = APPLICATION_JSON;
+        resp->body = out.dump();
+        return 200;
+    });
+    svc.POST("/server/webcams/item", [this](HttpRequest* req, HttpResponse* resp) -> int {
+        json cam;
+        try { cam = json::parse(req->body); } catch (...) { cam = json::object(); }
+        {
+            std::lock_guard<std::mutex> lock(webcam_mutex);
+            if (!cam.contains("uid") || !cam["uid"].is_string() ||
+                cam["uid"].get<std::string>().empty())
+                cam["uid"] = "cam" + std::to_string(webcam_id_counter++);
+            webcam_store[cam["uid"].get<std::string>()] = cam;
+            save_webcams();
+        }
+        json out; out["result"] = {{"webcam", cam}};
+        resp->content_type = APPLICATION_JSON;
+        resp->body = out.dump();
+        return 200;
+    });
+    svc.Handle("DELETE", "/server/webcams/item", [this](HttpRequest* req, HttpResponse* resp) -> int {
+        std::string uid = req->GetParam("uid");
+        {
+            std::lock_guard<std::mutex> lock(webcam_mutex);
+            webcam_store.erase(uid);
+            save_webcams();
+        }
+        json out; out["result"] = json::object();
+        resp->content_type = APPLICATION_JSON;
+        resp->body = out.dump();
+        return 200;
+    });
+    svc.GET("/server/webcams/*", json_404);
     svc.GET("/server/temperature_store", [](HttpRequest*, HttpResponse* resp) -> int {
         resp->content_type = APPLICATION_JSON;
         resp->body = "{\"result\":{}}";
@@ -1214,6 +1329,11 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
         config["path"]        = "/opt/usr/config";
         config["permissions"] = "rw";
         r.push_back(config);
+        json logs;
+        logs["name"]        = "logs";
+        logs["path"]        = "/opt/usr/logs";
+        logs["permissions"] = "r";
+        r.push_back(logs);
         send_response(r);
         return;
     }
@@ -1257,8 +1377,11 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
         std::string key = params.value("key", "");
         json value      = params.value("value", json(nullptr));
         std::string db_key = ns + "\x1f" + key;
-        std::lock_guard<std::mutex> lock(db_mutex);
-        db_store[db_key] = value;
+        {
+            std::lock_guard<std::mutex> lock(db_mutex);
+            db_store[db_key] = value;
+            save_db();
+        }
         json r;
         r["namespace"] = ns;
         r["key"]       = key;
@@ -1271,8 +1394,11 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
         std::string ns  = params.value("namespace", "");
         std::string key = params.value("key", "");
         std::string db_key = ns + "\x1f" + key;
-        std::lock_guard<std::mutex> lock(db_mutex);
-        db_store.erase(db_key);
+        {
+            std::lock_guard<std::mutex> lock(db_mutex);
+            db_store.erase(db_key);
+            save_db();
+        }
         send_response(json::object());
         return;
     }
@@ -1340,24 +1466,38 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
     }
 
     if (method == "server.webcams.list") {
-        json r;
-        r["webcams"] = json::array();
+        std::lock_guard<std::mutex> lock(webcam_mutex);
+        json r; r["webcams"] = json::array();
+        for (auto& kv : webcam_store) r["webcams"].push_back(kv.second);
         send_response(r);
         return;
     }
 
     if (method == "server.webcams.post_item" ||
         method == "server.webcams.update_item") {
-        // Accept webcam creation/update — no actual webcam on CC2,
-        // so just echo the params back as a confirmation.
-        json r = params; // echo back whatever was sent
-        if (!r.contains("uid")) r["uid"] = "";
+        json cam = params;
+        {
+            std::lock_guard<std::mutex> lock(webcam_mutex);
+            if (!cam.contains("uid") || !cam["uid"].is_string() ||
+                cam["uid"].get<std::string>().empty())
+                cam["uid"] = "cam" + std::to_string(webcam_id_counter++);
+            webcam_store[cam["uid"].get<std::string>()] = cam;
+            save_webcams();
+        }
+        json r; r["webcam"] = cam;
         send_response(r);
         return;
     }
 
     if (method == "server.webcams.delete_item") {
-        send_response(json::object());
+        std::string uid = params.value("uid", "");
+        {
+            std::lock_guard<std::mutex> lock(webcam_mutex);
+            webcam_store.erase(uid);
+            save_webcams();
+        }
+        json r; r["webcam"] = json::object();
+        send_response(r);
         return;
     }
 
@@ -1623,9 +1763,9 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
         return;
     }
 
-    // ── HELP command interception ─────────────────────────────────────────
-    // CC2 never sends gcode_response back for HELP, so synthesize it here
-    // by calling gcode/help and formatting the result for the console.
+    // ── Gcode command interception (HELP, STATUS, GET_POSITION) ──────────
+    // CC2 never sends gcode_response back for these informational commands,
+    // so we synthesize console output here and short-circuit the CC2 call.
     if (method == "printer.gcode.script") {
         std::string script = params.value("script", "");
         // Trim + uppercase for comparison
@@ -1636,6 +1776,7 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
         size_t e = up.find_last_not_of(' ');
         if (s != std::string::npos) up = up.substr(s, e - s + 1);
 
+        // ── HELP ──────────────────────────────────────────────────────────
         bool is_help = (up == "HELP" || (up.size() > 5 && up.substr(0, 5) == "HELP "));
         if (is_help) {
             broadcast_gcode_response("// echo:" + script);
@@ -1661,6 +1802,91 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
                     broadcast_gcode_response(help_text);
                 else if (!filter.empty())
                     broadcast_gcode_response("!! Unknown command: " + filter);
+            }
+            send_response(json("ok"));
+            return;
+        }
+
+        // ── STATUS ────────────────────────────────────────────────────────
+        if (up == "STATUS") {
+            broadcast_gcode_response("// echo:STATUS");
+            json qs = client->request("objects/query",
+                                      json({{"objects", nullptr}}));
+            if (qs.contains("result") && qs["result"].contains("status")) {
+                auto& st = qs["result"]["status"];
+                std::ostringstream msg;
+                msg << std::fixed << std::setprecision(1);
+                // State
+                if (st.contains("print_stats")) {
+                    std::string state = st["print_stats"].value("state", "unknown");
+                    msg << "// State: " << state;
+                    if (state == "printing" && st["print_stats"].contains("filename"))
+                        msg << " (" << st["print_stats"]["filename"].get<std::string>() << ")";
+                    msg << "\n";
+                }
+                // Temperatures
+                if (st.contains("extruder")) {
+                    double t   = st["extruder"].value("temperature", 0.0);
+                    double tgt = st["extruder"].value("target",      0.0);
+                    msg << "// Extruder: " << t << " / " << tgt << "\n";
+                }
+                if (st.contains("heater_bed")) {
+                    double t   = st["heater_bed"].value("temperature", 0.0);
+                    double tgt = st["heater_bed"].value("target",      0.0);
+                    msg << "// Bed:      " << t << " / " << tgt << "\n";
+                }
+                // Position
+                if (st.contains("gcode_move") && st["gcode_move"].contains("gcode_position")) {
+                    auto& pos = st["gcode_move"]["gcode_position"];
+                    if (pos.is_array() && pos.size() >= 3) {
+                        msg << std::setprecision(3);
+                        msg << "// Position X:" << pos[0].get<double>()
+                            << " Y:" << pos[1].get<double>()
+                            << " Z:" << pos[2].get<double>() << "\n";
+                    }
+                }
+                std::string out = msg.str();
+                if (!out.empty()) broadcast_gcode_response(out);
+            }
+            send_response(json("ok"));
+            return;
+        }
+
+        // ── GET_POSITION ──────────────────────────────────────────────────
+        if (up == "GET_POSITION") {
+            broadcast_gcode_response("// echo:GET_POSITION");
+            json qs = client->request("objects/query",
+                                      json({{"objects", nullptr}}));
+            if (qs.contains("result") && qs["result"].contains("status")) {
+                auto& st = qs["result"]["status"];
+                std::ostringstream msg;
+                msg << std::fixed << std::setprecision(6);
+                // toolhead.position = [x, y, z, e]
+                if (st.contains("toolhead") && st["toolhead"].contains("position")) {
+                    auto& pos = st["toolhead"]["position"];
+                    if (pos.is_array() && pos.size() >= 4) {
+                        msg << "// mcu:      x:" << pos[0].get<double>()
+                            << " y:" << pos[1].get<double>()
+                            << " z:" << pos[2].get<double>()
+                            << " e:" << pos[3].get<double>() << "\n";
+                        msg << "// toolhead: x:" << pos[0].get<double>()
+                            << " y:" << pos[1].get<double>()
+                            << " z:" << pos[2].get<double>()
+                            << " e:" << pos[3].get<double>() << "\n";
+                    }
+                }
+                // gcode_move.gcode_position = [x, y, z, e]
+                if (st.contains("gcode_move") && st["gcode_move"].contains("gcode_position")) {
+                    auto& gp = st["gcode_move"]["gcode_position"];
+                    if (gp.is_array() && gp.size() >= 4) {
+                        msg << "// gcode:    x:" << gp[0].get<double>()
+                            << " y:" << gp[1].get<double>()
+                            << " z:" << gp[2].get<double>()
+                            << " e:" << gp[3].get<double>() << "\n";
+                    }
+                }
+                std::string out = msg.str();
+                if (!out.empty()) broadcast_gcode_response(out);
             }
             send_response(json("ok"));
             return;

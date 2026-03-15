@@ -76,4 +76,15 @@ private:
     std::vector<json> job_queue;          // list of {job_id, filename, time_added}
     std::string queue_state = "ready";    // "ready" | "paused" | "loading" | "error"
     uint64_t jq_id_counter = 1;
+
+    // Webcam store — persisted to CONFIG_ROOT/.webcams.json
+    std::mutex webcam_mutex;
+    std::map<std::string, json> webcam_store; // key: uid
+    uint64_t webcam_id_counter = 1;
+    void load_webcams();
+    void save_webcams(); // must be called with webcam_mutex held
+
+    // Database persistence helpers
+    void load_db();
+    void save_db(); // must be called with db_mutex held
 };
