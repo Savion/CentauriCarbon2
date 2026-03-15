@@ -278,6 +278,100 @@ void BridgeServer::setup_http_routes(hv::HttpService& svc) {
         return cc2_http("gcode/firmware_restart", json::object(), resp);
     });
 
+    // ── /server/database/item  (HTTP GET + POST) ──────────────────────────
+    // Mainsail uses both WebSocket RPC and HTTP for database access.
+    svc.GET("/server/database/item", [this](HttpRequest* req, HttpResponse* resp) -> int {
+        std::string ns  = req->GetParam("namespace");
+        std::string key = req->GetParam("key");
+        std::string db_key = ns + "\x1f" + key;
+        resp->content_type = APPLICATION_JSON;
+        std::lock_guard<std::mutex> lock(db_mutex);
+        auto it = db_store.find(db_key);
+        if (it == db_store.end()) {
+            resp->body = "{\"error\":{\"message\":\"Key not found\",\"code\":404}}";
+            return 404;
+        }
+        json r; r["namespace"] = ns; r["key"] = key; r["value"] = it->second;
+        json out; out["result"] = r;
+        resp->body = out.dump();
+        return 200;
+    });
+
+    svc.POST("/server/database/item", [this](HttpRequest* req, HttpResponse* resp) -> int {
+        json body;
+        try { body = json::parse(req->body); } catch (...) {}
+        // params can come from JSON body or query string
+        std::string ns  = body.value("namespace", req->GetParam("namespace"));
+        std::string key = body.value("key",       req->GetParam("key"));
+        json value      = body.contains("value") ? body["value"] : json(nullptr);
+        std::string db_key = ns + "\x1f" + key;
+        {
+            std::lock_guard<std::mutex> lock(db_mutex);
+            db_store[db_key] = value;
+        }
+        json r; r["namespace"] = ns; r["key"] = key; r["value"] = value;
+        json out; out["result"] = r;
+        resp->content_type = APPLICATION_JSON;
+        resp->body = out.dump();
+        return 200;
+    });
+
+    svc.Handle("DELETE", "/server/database/item", [this](HttpRequest* req, HttpResponse* resp) -> int {
+        std::string ns  = req->GetParam("namespace");
+        std::string key = req->GetParam("key");
+        std::string db_key = ns + "\x1f" + key;
+        {
+            std::lock_guard<std::mutex> lock(db_mutex);
+            db_store.erase(db_key);
+        }
+        resp->content_type = APPLICATION_JSON;
+        resp->body = "{\"result\":{}}";
+        return 200;
+    });
+
+    // ── /server/database/list  (HTTP GET) ────────────────────────────────
+    svc.GET("/server/database/list", [this](HttpRequest*, HttpResponse* resp) -> int {
+        std::lock_guard<std::mutex> lock(db_mutex);
+        std::set<std::string> ns_set;
+        for (auto& kv : db_store) {
+            auto sep = kv.first.find('\x1f');
+            if (sep != std::string::npos)
+                ns_set.insert(kv.first.substr(0, sep));
+        }
+        json r; r["namespaces"] = json::array();
+        for (auto& ns : ns_set) r["namespaces"].push_back(ns);
+        json out; out["result"] = r;
+        resp->content_type = APPLICATION_JSON;
+        resp->body = out.dump();
+        return 200;
+    });
+
+    // ── API catch-all: return JSON 404 for unknown /server/ /printer/ /machine/ paths ──
+    // Must come BEFORE Static() so API paths don't fall through to index.html.
+    auto json_404 = [](HttpRequest* req, HttpResponse* resp) -> int {
+        resp->content_type = APPLICATION_JSON;
+        resp->body = "{\"error\":{\"message\":\"Not Found\",\"code\":404}}";
+        std::cerr << "[http] 404 " << req->path << "\n";
+        return 404;
+    };
+    svc.GET("/server/files/*",       json_404);
+    svc.POST("/server/files/*",      json_404);
+    svc.Handle("DELETE", "/server/files/*", json_404);
+    svc.GET("/server/history/*",     json_404);
+    svc.GET("/server/webcams/*",     json_404);
+    svc.GET("/server/temperature_store", [](HttpRequest*, HttpResponse* resp) -> int {
+        resp->content_type = APPLICATION_JSON;
+        resp->body = "{\"result\":{}}";
+        return 200;
+    });
+    svc.GET("/server/gcode_store", [](HttpRequest*, HttpResponse* resp) -> int {
+        resp->content_type = APPLICATION_JSON;
+        resp->body = "{\"result\":{\"gcode_store\":[]}}";
+        return 200;
+    });
+    svc.GET("/machine/*",            json_404);
+    svc.POST("/machine/*",           json_404);
+
     // ── Static web UI (Mainsail / Fluidd) ────────────────────────────────
     // Must be registered LAST so all API routes above take priority.
     // Enable with -w /path/to/mainsail on the command line.
@@ -324,6 +418,7 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
     if (!req.contains("method")) return;
 
     std::string method = req["method"];
+    std::cerr << "[ws] << " << method << "\n";
     json params = req.value("params", json::object());
     int64_t id = req.value("id", (int64_t)-1);
 
@@ -362,6 +457,196 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
 
     if (method == "access.oneshot_token") {
         send_response("");
+        return;
+    }
+
+    // Mainsail/Fluidd send this as the very first WS message to identify
+    // themselves. Moonraker responds with a unique connection_id.
+    if (method == "server.connection.identify") {
+        json r;
+        r["connection_id"] = (int64_t)(reinterpret_cast<uintptr_t>(ch.get()) & 0x7FFFFFFF);
+        send_response(r);
+        return;
+    }
+
+    // Stub out server.* methods Mainsail polls during init
+    if (method == "server.config") {
+        json r;
+        r["config"] = json::object();
+        r["orig"] = json::object();
+        send_response(r);
+        return;
+    }
+
+    if (method == "server.temperature_store") {
+        send_response(json::object());
+        return;
+    }
+
+    if (method == "server.gcode_store") {
+        json r;
+        r["gcode_store"] = json::array();
+        send_response(r);
+        return;
+    }
+
+    if (method == "server.files.list") {
+        send_response(json::array());
+        return;
+    }
+
+    if (method == "server.files.roots") {
+        json r = json::array();
+        json gcodes;
+        gcodes["name"]        = "gcodes";
+        gcodes["path"]        = "/opt/usr/gcode";
+        gcodes["permissions"] = "rw";
+        r.push_back(gcodes);
+        send_response(r);
+        return;
+    }
+
+    // ── server.database.* ─────────────────────────────────────────────────
+    if (method == "server.database.list") {
+        std::lock_guard<std::mutex> lock(db_mutex);
+        std::set<std::string> ns_set;
+        for (auto& kv : db_store) {
+            auto sep = kv.first.find('\x1f');
+            if (sep != std::string::npos)
+                ns_set.insert(kv.first.substr(0, sep));
+        }
+        json r;
+        r["namespaces"] = json::array();
+        for (auto& ns : ns_set) r["namespaces"].push_back(ns);
+        send_response(r);
+        return;
+    }
+
+    if (method == "server.database.get_item") {
+        std::string ns  = params.value("namespace", "");
+        std::string key = params.value("key", "");
+        std::string db_key = ns + "\x1f" + key;
+        std::lock_guard<std::mutex> lock(db_mutex);
+        auto it = db_store.find(db_key);
+        if (it == db_store.end()) {
+            send_error("Key not found: " + db_key);
+        } else {
+            json r;
+            r["namespace"] = ns;
+            r["key"]       = key;
+            r["value"]     = it->second;
+            send_response(r);
+        }
+        return;
+    }
+
+    if (method == "server.database.post_item") {
+        std::string ns  = params.value("namespace", "");
+        std::string key = params.value("key", "");
+        json value      = params.value("value", json(nullptr));
+        std::string db_key = ns + "\x1f" + key;
+        std::lock_guard<std::mutex> lock(db_mutex);
+        db_store[db_key] = value;
+        json r;
+        r["namespace"] = ns;
+        r["key"]       = key;
+        r["value"]     = value;
+        send_response(r);
+        return;
+    }
+
+    if (method == "server.database.delete_item") {
+        std::string ns  = params.value("namespace", "");
+        std::string key = params.value("key", "");
+        std::string db_key = ns + "\x1f" + key;
+        std::lock_guard<std::mutex> lock(db_mutex);
+        db_store.erase(db_key);
+        send_response(json::object());
+        return;
+    }
+
+    // ── machine.* ────────────────────────────────────────────────────────
+    if (method == "machine.system_info") {
+        json info;
+        info["cpu_info"] = {
+            {"cpu_count", 4}, {"bits", "32bit"}, {"processor", "armv7l"},
+            {"cpu_desc", "Allwinner A83T"}, {"hardware_desc", "Elegoo CC2"},
+            {"model", "Elegoo CentauriCarbon2"},
+            {"total_memory", 524288}, {"memory_units", "kB"}
+        };
+        info["sd_info"]            = {{"total_bytes",0},{"used_bytes",0},{"manufacturer_id",""}};
+        info["distribution"]       = {{"name","TinaLinux"},{"id","tinalinux"},{"version","1.0"}};
+        info["available_services"] = json::array();
+        info["service_state"]      = json::object();
+        info["virtualization"]     = {{"virt_type","none"},{"virt_identifier","none"}};
+        info["network"]            = json::object();
+        info["canbus"]             = json::object();
+        json r; r["system_info"]   = info;
+        send_response(r);
+        return;
+    }
+
+    if (method == "machine.proc_stats") {
+        json r;
+        r["moonraker_stats"]    = json::array();
+        r["throttled_state"]    = {{"bits", 0}, {"flags", json::array()}};
+        r["cpu_temp"]           = 45.0;
+        r["network"]            = json::object();
+        r["system_cpu_usage"]   = {{"cpu", 0.0}};
+        r["system_memory"]      = {{"total", 524288}, {"available", 262144}, {"used", 262144}};
+        r["websocket_connections"] = (int)ws_clients.size();
+        send_response(r);
+        return;
+    }
+
+    if (method == "machine.update.status") {
+        json r;
+        r["busy"]           = false;
+        r["github_rate_limit_reset_time"] = 0;
+        r["version_info"]   = json::object();
+        send_response(r);
+        return;
+    }
+
+    if (method == "server.history.list") {
+        json r;
+        r["count"] = 0;
+        r["jobs"]  = json::array();
+        send_response(r);
+        return;
+    }
+
+    if (method == "server.history.totals") {
+        json r;
+        r["job_totals"] = {
+            {"total_jobs", 0}, {"total_time", 0.0},
+            {"total_print_time", 0.0}, {"total_filament_used", 0.0},
+            {"longest_job", 0.0}, {"longest_print", 0.0}
+        };
+        send_response(r);
+        return;
+    }
+
+    if (method == "server.webcams.list") {
+        json r;
+        r["webcams"] = json::array();
+        send_response(r);
+        return;
+    }
+
+    if (method == "server.files.metadata") {
+        // Mainsail polls this for the currently-loaded file.
+        // Return an empty object — no file loaded.
+        send_response(json::object());
+        return;
+    }
+
+    if (method == "server.files.get_directory") {
+        json r;
+        r["dirs"]  = json::array();
+        r["files"] = json::array();
+        r["disk_usage"] = {{"total", 6700000000}, {"used", 1200000000}, {"free", 5000000000}};
+        send_response(r);
         return;
     }
 

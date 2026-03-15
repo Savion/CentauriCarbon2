@@ -6,6 +6,7 @@
  *****************************************************************************/
 #pragma once
 
+#include <map>
 #include <memory>
 #include <set>
 #include <mutex>
@@ -58,4 +59,9 @@ private:
 
     std::mutex       ws_clients_mutex;
     std::set<WebSocketChannelPtr> ws_clients;
+
+    // In-memory key-value store for server.database.* calls.
+    // Key format: "namespace\x1fkey"
+    std::mutex db_mutex;
+    std::map<std::string, json> db_store;
 };
