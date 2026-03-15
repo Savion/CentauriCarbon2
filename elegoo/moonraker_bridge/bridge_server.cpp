@@ -1891,6 +1891,185 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
             send_response(json("ok"));
             return;
         }
+
+        // Helper: match a command that may or may not have trailing arguments
+        // e.g. cmd_is("M105") matches "M105" and "M105 S1"
+        auto cmd_is = [&up](const std::string& cmd) -> bool {
+            return up == cmd ||
+                   (up.size() > cmd.size() && up[cmd.size()] == ' ' &&
+                    up.substr(0, cmd.size()) == cmd);
+        };
+
+        // ── M105 / TEMPERATURE_REPORT ─────────────────────────────────────
+        // Report extruder + bed temperatures in standard "ok T:xx/xx B:xx/xx" format.
+        if (cmd_is("M105")) {
+            broadcast_gcode_response("// echo:" + script);
+            json qs = client->request("objects/query", json({{"objects", nullptr}}));
+            if (qs.contains("result") && qs["result"].contains("status")) {
+                auto& st = qs["result"]["status"];
+                std::ostringstream msg;
+                msg << std::fixed << std::setprecision(1) << "ok";
+                if (st.contains("extruder"))
+                    msg << " T:"  << st["extruder"].value("temperature", 0.0)
+                        << " /"   << st["extruder"].value("target",      0.0);
+                if (st.contains("heater_bed"))
+                    msg << " B:"  << st["heater_bed"].value("temperature", 0.0)
+                        << " /"   << st["heater_bed"].value("target",      0.0);
+                broadcast_gcode_response(msg.str());
+            }
+            send_response(json("ok"));
+            return;
+        }
+
+        // ── M114 (current position — Marlin format) ───────────────────────
+        if (cmd_is("M114")) {
+            broadcast_gcode_response("// echo:" + script);
+            json qs = client->request("objects/query", json({{"objects", nullptr}}));
+            if (qs.contains("result") && qs["result"].contains("status")) {
+                auto& st = qs["result"]["status"];
+                double x = 0, y = 0, z = 0, e = 0;
+                if (st.contains("gcode_move") &&
+                    st["gcode_move"].contains("gcode_position")) {
+                    auto& gp = st["gcode_move"]["gcode_position"];
+                    if (gp.is_array() && gp.size() >= 4) {
+                        x = gp[0].get<double>(); y = gp[1].get<double>();
+                        z = gp[2].get<double>(); e = gp[3].get<double>();
+                    }
+                } else if (st.contains("toolhead") &&
+                           st["toolhead"].contains("position")) {
+                    auto& pos = st["toolhead"]["position"];
+                    if (pos.is_array() && pos.size() >= 4) {
+                        x = pos[0].get<double>(); y = pos[1].get<double>();
+                        z = pos[2].get<double>(); e = pos[3].get<double>();
+                    }
+                }
+                std::ostringstream msg;
+                msg << std::fixed << std::setprecision(3);
+                msg << "X:" << x << " Y:" << y << " Z:" << z << " E:" << e;
+                broadcast_gcode_response(msg.str());
+            }
+            send_response(json("ok"));
+            return;
+        }
+
+        // ── M115 (firmware info) ─────────────────────────────────────────
+        if (cmd_is("M115")) {
+            broadcast_gcode_response("// echo:" + script);
+            json info = client->request("info", json::object());
+            std::string fw_ver = "unknown";
+            if (info.contains("result") && info["result"].is_object()) {
+                auto& r = info["result"];
+                if (r.contains("software_version") && r["software_version"].is_string())
+                    fw_ver = r["software_version"].get<std::string>();
+            }
+            broadcast_gcode_response(
+                "FIRMWARE_NAME:Klipper FIRMWARE_VERSION:" + fw_ver +
+                " SOURCE_CODE_URL:https://github.com/Klipper3d/klipper"
+                " PROTOCOL_VERSION:1.0 MACHINE_TYPE:Elegoo CC2");
+            send_response(json("ok"));
+            return;
+        }
+
+        // ── QUERY_ENDSTOPS / M119 ─────────────────────────────────────────
+        if (cmd_is("QUERY_ENDSTOPS") || cmd_is("M119")) {
+            broadcast_gcode_response("// echo:" + script);
+            json qs = client->request("objects/query", json({{"objects", nullptr}}));
+            bool printed = false;
+            if (qs.contains("result") && qs["result"].contains("status")) {
+                auto& st = qs["result"]["status"];
+                // Prefer query_endstops.last_query if CC2 exposes it
+                if (st.contains("query_endstops") &&
+                    st["query_endstops"].contains("last_query") &&
+                    st["query_endstops"]["last_query"].is_object()) {
+                    auto& lq = st["query_endstops"]["last_query"];
+                    std::string out;
+                    for (auto it = lq.begin(); it != lq.end(); ++it) {
+                        if (!out.empty()) out += " ";
+                        bool trig = it.value().is_boolean()
+                            ? it.value().get<bool>()
+                            : (it.value().get<int>() != 0);
+                        out += it.key() + ":" + (trig ? "TRIGGERED" : "open");
+                    }
+                    if (!out.empty()) { broadcast_gcode_response(out); printed = true; }
+                }
+                // Fallback: report homed axes from toolhead
+                if (!printed && st.contains("toolhead") &&
+                    st["toolhead"].contains("homed_axes")) {
+                    std::string homed = st["toolhead"].value("homed_axes", "");
+                    broadcast_gcode_response(
+                        "// Homed axes: " + (homed.empty() ? "none" : homed));
+                    printed = true;
+                }
+            }
+            if (!printed)
+                broadcast_gcode_response("// Endstop data unavailable");
+            send_response(json("ok"));
+            return;
+        }
+
+        // ── BED_MESH_OUTPUT ───────────────────────────────────────────────
+        if (cmd_is("BED_MESH_OUTPUT")) {
+            broadcast_gcode_response("// echo:" + script);
+            json qs = client->request("objects/query", json({{"objects", nullptr}}));
+            bool printed = false;
+            if (qs.contains("result") && qs["result"].contains("status")) {
+                auto& st = qs["result"]["status"];
+                if (st.contains("bed_mesh")) {
+                    auto& mesh = st["bed_mesh"];
+                    std::string profile = mesh.value("profile_name", "");
+                    if (!profile.empty())
+                        broadcast_gcode_response("// Mesh profile: " + profile);
+                    // Print row-by-row if probed_matrix is available
+                    if (mesh.contains("probed_matrix") &&
+                        mesh["probed_matrix"].is_array()) {
+                        int row_idx = 0;
+                        for (auto& row : mesh["probed_matrix"]) {
+                            std::ostringstream line;
+                            line << "// row " << row_idx++ << ": " << std::fixed
+                                 << std::setprecision(4);
+                            for (size_t i = 0; i < row.size(); ++i) {
+                                if (i > 0) line << "  ";
+                                line << row[i].get<double>();
+                            }
+                            broadcast_gcode_response(line.str());
+                        }
+                        printed = true;
+                    }
+                }
+            }
+            if (!printed)
+                broadcast_gcode_response("// No bed mesh data available");
+            send_response(json("ok"));
+            return;
+        }
+
+        // ── PROBE_ACCURACY / PROBE_CALIBRATE summary ──────────────────────
+        // These produce multi-line output; forward to CC2 but also tell the user
+        // to watch the console — CC2 may push result lines via status updates.
+        if (cmd_is("PROBE_ACCURACY") || cmd_is("PROBE_CALIBRATE") ||
+            cmd_is("PROBE")) {
+            broadcast_gcode_response("// echo:" + script);
+            // Fall through to CC2 — results arrive as push events
+        }
+
+        // ── SET_VELOCITY_LIMIT (no args → report current limits) ──────────
+        if (up == "SET_VELOCITY_LIMIT") {
+            broadcast_gcode_response("// echo:" + script);
+            json qs = client->request("objects/query", json({{"objects", nullptr}}));
+            if (qs.contains("result") && qs["result"].contains("status") &&
+                qs["result"]["status"].contains("toolhead")) {
+                auto& th = qs["result"]["status"]["toolhead"];
+                std::ostringstream msg;
+                msg << std::fixed << std::setprecision(0);
+                msg << "// velocity:"   << th.value("max_velocity",   300.0)
+                    << " accel:"        << th.value("max_accel",       3000.0)
+                    << " accel_to_decel:" << th.value("max_accel_to_decel", 1500.0)
+                    << " sq_corner_velocity:" << std::setprecision(1)
+                    << th.value("square_corner_velocity", 5.0);
+                broadcast_gcode_response(msg.str());
+            }
+            // Fall through to CC2 for actual limit update (no-op if no args)
+        }
     }
 
     // ── Forward to CC2 ────────────────────────────────────────────────────
