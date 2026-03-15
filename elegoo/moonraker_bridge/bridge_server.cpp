@@ -306,8 +306,11 @@ void BridgeServer::setup_http_routes(hv::HttpService& svc) {
     // GET /server/info  (Moonraker server metadata — synthesised)
     svc.GET("/server/info", [this](HttpRequest*, HttpResponse* resp) -> int {
         json r;
-        r["klippy_connected"] = client->is_connected();
-        r["klippy_state"]     = client->is_connected() ? "ready" : "disconnected";
+        // Always report "ready" — bridge wouldn't be running if CC2 wasn't reachable,
+        // and a momentary CC2 reconnect would cause Mainsail to enter a 2-second
+        // polling loop and get stuck at "reinitializing".
+        r["klippy_connected"] = true;
+        r["klippy_state"]     = "ready";
         r["components"]       = json::array({"connection_manager", "database",
                                              "file_manager", "klippy_apis"});
         r["registered_directories"] = json::array();
@@ -1052,8 +1055,9 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
     // ── Synthesised methods ───────────────────────────────────────────────
     if (method == "server.info") {
         json r;
-        r["klippy_connected"]   = client->is_connected();
-        r["klippy_state"]       = client->is_connected() ? "ready" : "disconnected";
+        // Always report "ready" — never trigger Mainsail's 2-second polling loop.
+        r["klippy_connected"]   = true;
+        r["klippy_state"]       = "ready";
         r["moonraker_version"]  = "v0.8.0-cc2bridge";
         r["components"]         = json::array({"klippy_apis"});
         r["registered_directories"] = json::array();
@@ -1550,6 +1554,9 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
 
     // Special post-processing for printer.info
     if (method == "printer.info") {
+        // Always inject "ready" so Mainsail doesn't show "reinitializing"
+        if (!result.contains("state"))         result["state"]         = "ready";
+        if (!result.contains("state_message")) result["state_message"] = "Printer is ready";
         if (!result.contains("klipper_path"))
             result["klipper_path"] = result.value("elegoo_path", "/home/eeb001/elegoo");
         if (!result.contains("components"))
@@ -1590,6 +1597,12 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
             // Provide proper default status values for known virtual objects
             if (key == "display_status") {
                 status[key] = {{"progress", 0.0}, {"message", ""}};
+            } else if (key == "webhooks") {
+                // Mainsail checks webhooks.state === "ready" to exit "reinitializing".
+                // CC2 doesn't expose webhooks, so always inject the ready state.
+                status[key] = {{"state", "ready"}, {"state_message", "Printer is ready"}};
+            } else if (key == "idle_timeout") {
+                status[key] = {{"state", "Idle"}, {"printing_time", 0.0}};
             } else if (key == "gcode_macro pause" ||
                        key == "gcode_macro resume" ||
                        key == "gcode_macro cancel_print" ||
@@ -1617,6 +1630,13 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
                 status[key] = json::object();
             }
         }
+    }
+
+    // Mainsail expects eventtime in subscribe/query results.
+    // Without it the client-side store may not process the initial status correctly.
+    if ((method == "printer.objects.subscribe" || method == "printer.objects.query") &&
+        !result.contains("eventtime")) {
+        result["eventtime"] = (double)time(nullptr);
     }
 
     send_response(result);
