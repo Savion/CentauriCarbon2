@@ -256,12 +256,25 @@ void BridgeServer::broadcast_update(const json& cc2_update) {
     //                     "params":[{"eventtime":N,"status":{...}}]}
     json notify;
     notify["jsonrpc"] = "2.0";
-    notify["method"] = "notify_status_update";
 
-    if (cc2_update.contains("params")) {
-        notify["params"] = json::array({cc2_update["params"]});
+    // If CC2 already uses Moonraker's method name (e.g. notify_gcode_response),
+    // forward it as-is.  Otherwise wrap as notify_status_update.
+    if (cc2_update.contains("method") && cc2_update["method"].is_string()) {
+        notify["method"] = cc2_update["method"];
+        notify["params"] = cc2_update.value("params", json::array());
+    } else if (cc2_update.contains("params") && cc2_update["params"].is_object() &&
+               cc2_update["params"].contains("gcode_response")) {
+        // CC2 wraps gcode output as params.gcode_response
+        notify["method"] = "notify_gcode_response";
+        notify["params"] = json::array({cc2_update["params"]["gcode_response"]});
     } else {
-        notify["params"] = json::array({cc2_update});
+        // Standard status update
+        notify["method"] = "notify_status_update";
+        if (cc2_update.contains("params")) {
+            notify["params"] = json::array({cc2_update["params"]});
+        } else {
+            notify["params"] = json::array({cc2_update});
+        }
     }
 
     std::string payload = notify.dump();
@@ -272,6 +285,18 @@ void BridgeServer::broadcast_update(const json& cc2_update) {
             ch->send(payload);
         }
     }
+}
+
+// ── Helper: broadcast notify_gcode_response to all WS clients ─────────────
+void BridgeServer::broadcast_gcode_response(const std::string& msg) {
+    json notify;
+    notify["jsonrpc"] = "2.0";
+    notify["method"]  = "notify_gcode_response";
+    notify["params"]  = json::array({msg});
+    std::string payload = notify.dump();
+    std::lock_guard<std::mutex> lock(ws_clients_mutex);
+    for (auto& ch : ws_clients)
+        if (ch && ch->isConnected()) ch->send(payload);
 }
 
 // ── Helper: forward to CC2, wrap in Moonraker HTTP response ───────────────
@@ -1592,15 +1617,34 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
         auto& status = result["status"];
         for (auto it = params["objects"].begin(); it != params["objects"].end(); ++it) {
             const std::string& key = it.key();
-            if (status.contains(key)) continue;
 
-            // Provide proper default status values for known virtual objects
-            if (key == "display_status") {
+            // Provide proper default status values for known virtual objects.
+            // NOTE: do NOT skip with 'continue' for webhooks/configfile even if CC2
+            // already provided them — CC2 may return webhooks.state="startup" or
+            // configfile without the synthetic macro sections, both of which cause
+            // Mainsail to stay stuck at "reinitializing" / show the config warning.
+            if (key == "webhooks") {
+                // Force "ready" regardless of what CC2 reports.
+                // CC2/Klipper may send state="startup" during the init window.
+                status[key]["state"]         = "ready";
+                status[key]["state_message"] = "Printer is ready";
+            } else if (key == "configfile") {
+                // Always inject/merge the synthetic macro sections so Mainsail's
+                // "PAUSE macro not found in config" warning never appears.
+                auto& cf = status["configfile"];
+                if (!cf.is_object()) cf = json::object();
+                if (!cf.contains("config") || !cf["config"].is_object())
+                    cf["config"] = json::object();
+                if (!cf.contains("settings")) cf["settings"] = json::object();
+                cf["save_config_pending"] = false;
+                cf["config"]["gcode_macro pause"]        = {{"gcode", ""}, {"description", "Pause print"}};
+                cf["config"]["gcode_macro resume"]       = {{"gcode", ""}, {"description", "Resume print"}};
+                cf["config"]["gcode_macro cancel_print"] = {{"gcode", ""}, {"description", "Cancel print"}};
+                cf["config"]["display_status"]           = json::object();
+            } else if (status.contains(key)) {
+                continue; // CC2 provided it, no need to stub
+            } else if (key == "display_status") {
                 status[key] = {{"progress", 0.0}, {"message", ""}};
-            } else if (key == "webhooks") {
-                // Mainsail checks webhooks.state === "ready" to exit "reinitializing".
-                // CC2 doesn't expose webhooks, so always inject the ready state.
-                status[key] = {{"state", "ready"}, {"state_message", "Printer is ready"}};
             } else if (key == "idle_timeout") {
                 status[key] = {{"state", "Idle"}, {"printing_time", 0.0}};
             } else if (key == "gcode_macro pause" ||
@@ -1608,24 +1652,6 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
                        key == "gcode_macro cancel_print" ||
                        key.substr(0, 11) == "gcode_macro") {
                 status[key] = {{"variables", json::object()}};
-            } else if (key == "configfile") {
-                // Inject synthetic configfile.config so Mainsail macro checks pass.
-                // Without these sections Mainsail shows "PAUSE macro not found in config".
-                json cfg_config = json::object();
-                cfg_config["gcode_macro pause"]        = {{"gcode", ""}, {"description", "Pause print"}};
-                cfg_config["gcode_macro resume"]       = {{"gcode", ""}, {"description", "Resume print"}};
-                cfg_config["gcode_macro cancel_print"] = {{"gcode", ""}, {"description", "Cancel print"}};
-                cfg_config["display_status"]           = json::object();
-                // Merge in real config sections if CC2 already provided them
-                if (status.contains("configfile") && status["configfile"].contains("config")) {
-                    for (auto sit = status["configfile"]["config"].begin();
-                         sit != status["configfile"]["config"].end(); ++sit) {
-                        cfg_config[sit.key()] = sit.value();
-                    }
-                }
-                status[key]["config"]   = cfg_config;
-                status[key]["settings"] = json::object();
-                status[key]["save_config_pending"] = false;
             } else {
                 status[key] = json::object();
             }
@@ -1637,6 +1663,22 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
     if ((method == "printer.objects.subscribe" || method == "printer.objects.query") &&
         !result.contains("eventtime")) {
         result["eventtime"] = (double)time(nullptr);
+    }
+
+    // Echo gcode commands to the console via notify_gcode_response.
+    // Mainsail's console panel listens only for these notifications — gcode/script
+    // responses are never shown otherwise.
+    if (method == "printer.gcode.script") {
+        std::string script = params.value("script", "");
+        if (!script.empty())
+            broadcast_gcode_response("// echo:" + script);
+        // Also forward any text response CC2 included in the result
+        if (result.is_string() && !result.get<std::string>().empty()) {
+            broadcast_gcode_response(result.get<std::string>());
+        } else if (result.is_object() && result.contains("response") &&
+                   result["response"].is_string()) {
+            broadcast_gcode_response(result["response"].get<std::string>());
+        }
     }
 
     send_response(result);

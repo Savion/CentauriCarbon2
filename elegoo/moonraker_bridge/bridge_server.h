@@ -47,6 +47,9 @@ private:
     // Broadcast Moonraker notify_status_update to all WS clients
     void broadcast_update(const json& cc2_update);
 
+    // Broadcast notify_gcode_response to all WS clients (console output)
+    void broadcast_gcode_response(const std::string& msg);
+
     // Helper: call CC2, wrap result in Moonraker HTTP 200 JSON
     // Returns HTTP status code
     int cc2_http(const std::string& method,
