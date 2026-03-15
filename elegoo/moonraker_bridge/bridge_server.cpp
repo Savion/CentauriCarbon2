@@ -125,6 +125,13 @@ static json list_files_flat(const std::string& dir_path,
     return arr;
 }
 
+// Helper: split "gcodes/sub/file.gcode" → {"gcodes", "sub/file.gcode"}
+static std::pair<std::string,std::string> split_root_path(const std::string& path) {
+    auto slash = path.find('/');
+    if (slash == std::string::npos) return {path, ""};
+    return {path.substr(0, slash), path.substr(slash + 1)};
+}
+
 // ── Moonraker → CC2 method translation ────────────────────────────────────
 static std::string moonraker_to_cc2(const std::string& method) {
     // Dots to slashes, drop "printer." prefix
@@ -172,6 +179,33 @@ void BridgeServer::start() {
     server.start();
     std::cerr << "[bridge] Moonraker bridge listening on port " << port << "\n";
     start_subscription();
+    start_proc_stat_broadcast();
+}
+
+// Periodically broadcast notify_proc_stat_update so Mainsail's System Loads panel updates
+void BridgeServer::start_proc_stat_broadcast() {
+    std::thread([this]() {
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            json notify;
+            notify["jsonrpc"] = "2.0";
+            notify["method"]  = "notify_proc_stat_update";
+            json stat;
+            stat["moonraker_stats"]  = json::object();
+            stat["throttled_state"]  = {{"bits", 0}, {"flags", json::array()}};
+            stat["cpu_temp"]         = 45.0;
+            stat["network"]          = json::object();
+            stat["system_cpu_usage"] = {{"cpu", 5.0}};
+            stat["system_memory"]    = {{"total", 524288}, {"available", 262144}, {"used", 262144}};
+            stat["system_uptime"]    = (double)time(nullptr);
+            notify["params"]         = json::array({stat});
+            std::string payload = notify.dump();
+            std::lock_guard<std::mutex> lock(ws_clients_mutex);
+            for (auto& ch : ws_clients) {
+                if (ch && ch->isConnected()) ch->send(payload);
+            }
+        }
+    }).detach();
 }
 
 void BridgeServer::stop() {
@@ -620,6 +654,59 @@ void BridgeServer::setup_http_routes(hv::HttpService& svc) {
         resp->content_type = APPLICATION_JSON;
         resp->body = out.dump();
         return 200;
+    });
+    svc.POST("/server/history/reset_totals", [](HttpRequest*, HttpResponse* resp) -> int {
+        json out; out["result"] = json::object();
+        resp->content_type = APPLICATION_JSON; resp->body = out.dump(); return 200;
+    });
+
+    // ── File move/copy (HTTP) — used by Mainsail rename/move dialog ───────
+    svc.POST("/server/files/move", [](HttpRequest* req, HttpResponse* resp) -> int {
+        json body; try { body = json::parse(req->body); } catch (...) {}
+        resp->content_type = APPLICATION_JSON;
+        std::string src = body.value("source", "");
+        std::string dst = body.value("dest", "");
+        if (src.empty() || dst.empty()) {
+            resp->body = "{\"error\":{\"message\":\"source/dest required\",\"code\":400}}"; return 400;
+        }
+        auto sp = split_root_path(src);
+        auto dp = split_root_path(dst);
+        std::string src_path = root_to_path(sp.first) + "/" + sp.second;
+        std::string dst_path = root_to_path(dp.first) + "/" + dp.second;
+        if (src_path.find("..") != std::string::npos || dst_path.find("..") != std::string::npos) {
+            resp->body = "{\"error\":{\"message\":\"Forbidden\",\"code\":403}}"; return 403;
+        }
+        if (rename(src_path.c_str(), dst_path.c_str()) != 0) {
+            resp->body = "{\"error\":{\"message\":\"Move failed\",\"code\":500}}"; return 500;
+        }
+        json out; out["result"] = {{"item",{{"root",dp.first},{"path",dp.second}}},
+                                    {"source_item",{{"root",sp.first},{"path",sp.second}}},
+                                    {"action","move_file"}};
+        resp->body = out.dump(); return 200;
+    });
+    svc.POST("/server/files/copy", [](HttpRequest* req, HttpResponse* resp) -> int {
+        json body; try { body = json::parse(req->body); } catch (...) {}
+        resp->content_type = APPLICATION_JSON;
+        std::string src = body.value("source", "");
+        std::string dst = body.value("dest", "");
+        if (src.empty() || dst.empty()) {
+            resp->body = "{\"error\":{\"message\":\"source/dest required\",\"code\":400}}"; return 400;
+        }
+        auto sp = split_root_path(src);
+        auto dp = split_root_path(dst);
+        std::string src_path = root_to_path(sp.first) + "/" + sp.second;
+        std::string dst_path = root_to_path(dp.first) + "/" + dp.second;
+        if (src_path.find("..") != std::string::npos || dst_path.find("..") != std::string::npos) {
+            resp->body = "{\"error\":{\"message\":\"Forbidden\",\"code\":403}}"; return 403;
+        }
+        std::ifstream ifs(src_path, std::ios::binary);
+        std::ofstream ofs(dst_path, std::ios::binary);
+        if (!ifs || !ofs) {
+            resp->body = "{\"error\":{\"message\":\"Copy failed\",\"code\":500}}"; return 500;
+        }
+        ofs << ifs.rdbuf();
+        json out; out["result"] = {{"item",{{"root",dp.first},{"path",dp.second}}},{"action","create_file"}};
+        resp->body = out.dump(); return 200;
     });
 
     // ── Job Queue HTTP endpoints ──────────────────────────────────────────
@@ -1320,6 +1407,128 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
     }
     if (method == "server.job_queue.jump") {
         send_response(json::object());
+        return;
+    }
+
+    // ── File operations (WS) ──────────────────────────────────────────────
+    // server.files.delete_file: {path: "gcodes/file.gcode"}
+    if (method == "server.files.delete_file") {
+        std::string path = params.value("path", "");
+        auto rp = split_root_path(path);
+        std::string full = root_to_path(rp.first);
+        if (full.empty() || rp.second.empty() || rp.second.find("..") != std::string::npos) {
+            send_error("Forbidden"); return;
+        }
+        full += "/" + rp.second;
+        if (remove(full.c_str()) != 0) { send_error("Delete failed"); return; }
+        json r; r["item"] = {{"root", rp.first}, {"path", rp.second}}; r["action"] = "delete_file";
+        send_response(r);
+        return;
+    }
+    // server.files.move: {source: "gcodes/a.gcode", dest: "gcodes/b.gcode"}
+    if (method == "server.files.move") {
+        std::string src = params.value("source", ""), dst = params.value("dest", "");
+        auto sp = split_root_path(src), dp = split_root_path(dst);
+        std::string sp_full = root_to_path(sp.first) + "/" + sp.second;
+        std::string dp_full = root_to_path(dp.first) + "/" + dp.second;
+        if (sp_full.find("..") != std::string::npos || dp_full.find("..") != std::string::npos) {
+            send_error("Forbidden"); return;
+        }
+        if (rename(sp_full.c_str(), dp_full.c_str()) != 0) { send_error("Move failed"); return; }
+        json r;
+        r["item"]        = {{"root", dp.first}, {"path", dp.second}};
+        r["source_item"] = {{"root", sp.first}, {"path", sp.second}};
+        r["action"]      = "move_file";
+        send_response(r);
+        return;
+    }
+    // server.files.post_directory: {path: "gcodes/subdir"}
+    if (method == "server.files.post_directory") {
+        std::string path = params.value("path", "");
+        auto rp = split_root_path(path);
+        std::string full = root_to_path(rp.first);
+        if (full.empty() || rp.second.empty() || rp.second.find("..") != std::string::npos) {
+            send_error("Forbidden"); return;
+        }
+        full += "/" + rp.second;
+        mkdir(full.c_str(), 0755);
+        json r; r["item"] = {{"root", rp.first}, {"path", rp.second}}; r["action"] = "create_dir";
+        send_response(r);
+        return;
+    }
+    // server.files.delete_directory: {path: "gcodes/subdir"}
+    if (method == "server.files.delete_directory") {
+        std::string path = params.value("path", "");
+        auto rp = split_root_path(path);
+        std::string full = root_to_path(rp.first);
+        if (full.empty() || rp.second.empty() || rp.second.find("..") != std::string::npos) {
+            send_error("Forbidden"); return;
+        }
+        full += "/" + rp.second;
+        rmdir(full.c_str());
+        json r; r["item"] = {{"root", rp.first}, {"path", rp.second}}; r["action"] = "delete_dir";
+        send_response(r);
+        return;
+    }
+    // server.files.metascan: scan file metadata (stub — return empty)
+    if (method == "server.files.metascan") {
+        send_response(json::object());
+        return;
+    }
+    // server.files.rollover_logs: roll log files (stub — return empty)
+    if (method == "server.files.rollover_logs") {
+        json r; r["rolled_over"] = json::array(); r["failed"] = json::object();
+        send_response(r);
+        return;
+    }
+
+    // ── Timelapse stubs ───────────────────────────────────────────────────
+    if (method == "machine.timelapse.get_settings") {
+        json r;
+        r["enabled"]       = false;
+        r["mode"]          = "layermacro";
+        r["camera"]        = "";
+        r["fps"]           = 25;
+        r["quality"]       = "high";
+        r["save_frames"]   = false;
+        r["park_head"]     = false;
+        r["park_pos"]      = "back_left";
+        r["park_time"]     = 0.1;
+        r["fw_retract"]    = false;
+        r["constant_rate_factor"] = 23;
+        r["output_framerate"]     = 30;
+        r["variable_fps"]         = false;
+        r["variable_fps_min"]     = 5;
+        r["variable_fps_max"]     = 60;
+        r["previewimage"]         = true;
+        r["duplicatelastframe"]   = 0;
+        r["extraoutputparams"]    = "";
+        r["rotation"]             = 0;
+        r["flip_x"]               = false;
+        r["flip_y"]               = false;
+        r["snapshoturl"]          = "";
+        r["blockedhostname"]      = "";
+        r["gcode_verbose"]        = false;
+        r["run_at_print_start"]   = false;
+        send_response(r);
+        return;
+    }
+    if (method == "machine.timelapse.lastframeinfo") {
+        json r; r["framecount"] = 0; r["lastframefile"] = "";
+        send_response(r);
+        return;
+    }
+    if (method == "machine.timelapse.post_settings") {
+        // Echo back the settings, merged with defaults
+        json r = params; // whatever was sent
+        send_response(r);
+        return;
+    }
+
+    // ── Spoolman active spool set ─────────────────────────────────────────
+    if (method == "server.spoolman.post_spool_id") {
+        json r; r["spool_id"] = params.value("spool_id", json(nullptr));
+        send_response(r);
         return;
     }
 

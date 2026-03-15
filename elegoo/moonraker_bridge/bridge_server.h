@@ -38,6 +38,9 @@ private:
     // CC2 subscription management
     void start_subscription();
 
+    // Periodic proc_stats broadcast to WS clients
+    void start_proc_stat_broadcast();
+
     // WebSocket JSON-RPC dispatcher
     void handle_ws_rpc(const WebSocketChannelPtr& ch, const std::string& raw);
 
