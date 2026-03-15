@@ -87,4 +87,10 @@ private:
     // Database persistence helpers
     void load_db();
     void save_db(); // must be called with db_mutex held
+
+    // Last-known printer status from subscription pushes.
+    // Updated on every broadcast_update(); read by synthesis handlers
+    // so they never need to make a second CC2 round-trip.
+    std::mutex status_mutex;
+    json last_status = json::object();
 };

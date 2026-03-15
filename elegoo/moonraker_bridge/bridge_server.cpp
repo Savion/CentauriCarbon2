@@ -325,14 +325,25 @@ void BridgeServer::start_subscription() {
         broadcast_update(msg);
     });
 
-    // The subscribe request is fire-and-forget here; response is just the
-    // initial status dump which we don't need to surface specially.
+    // Send the subscribe request and seed last_status from the initial response.
+    // CC2 returns the full current status in the subscribe reply, so capturing it
+    // means synthesis commands (STATUS, GET_POSITION, M105, etc.) work immediately
+    // even before the first push event arrives.
     std::thread([this, params]() {
         // Wait until CC2 is connected
         for (int i = 0; i < 30 && !client->is_connected(); ++i)
             std::this_thread::sleep_for(std::chrono::seconds(1));
-        if (client->is_connected())
-            client->request("objects/subscribe", params, 10000);
+        if (!client->is_connected()) return;
+        json resp = client->request("objects/subscribe", params, 10000);
+        // Seed last_status from the initial full status dump
+        if (resp.contains("result") && resp["result"].is_object() &&
+            resp["result"].contains("status") &&
+            resp["result"]["status"].is_object()) {
+            std::lock_guard<std::mutex> lk(status_mutex);
+            last_status = resp["result"]["status"];
+            std::cerr << "[bridge] Seeded last_status with "
+                      << last_status.size() << " objects from subscribe\n";
+        }
     }).detach();
 }
 
@@ -347,9 +358,19 @@ void BridgeServer::broadcast_update(const json& cc2_update) {
 
     // ── Case 1: CC2 already names the method (e.g. notify_gcode_response) ──
     if (cc2_update.contains("method") && cc2_update["method"].is_string()) {
+        std::string cc2_method_name = cc2_update["method"].get<std::string>();
+        // Block CC2 disconnect/shutdown events — forwarding them causes Mainsail
+        // to enter its 2-second "reinitializing" polling loop even though our
+        // bridge is still up.  CC2 reconnects automatically; Mainsail doesn't
+        // need to know about transient socket drops.
+        if (cc2_method_name == "notify_klippy_disconnected" ||
+            cc2_method_name == "notify_klippy_shutdown") {
+            std::cerr << "[bridge] Filtered CC2 event: " << cc2_method_name << "\n";
+            return;
+        }
         json notify;
         notify["jsonrpc"] = "2.0";
-        notify["method"]  = cc2_update["method"];
+        notify["method"]  = cc2_method_name;
         notify["params"]  = cc2_update.value("params", json::array());
         std::string payload = notify.dump();
         std::lock_guard<std::mutex> lock(ws_clients_mutex);
@@ -379,6 +400,23 @@ void BridgeServer::broadcast_update(const json& cc2_update) {
             // stripped so it doesn't confuse Mainsail's status store).
             json stripped = cc2_update;
             stripped["params"]["status"].erase("gcode_response");
+            // Merge stripped status into last_status cache
+            {
+                std::lock_guard<std::mutex> lk(status_mutex);
+                auto& incoming = stripped["params"]["status"];
+                for (auto it = incoming.begin(); it != incoming.end(); ++it) {
+                    if (last_status.contains(it.key()) &&
+                        last_status[it.key()].is_object() && it.value().is_object()) {
+                        for (auto jt = it.value().begin(); jt != it.value().end(); ++jt)
+                            last_status[it.key()][jt.key()] = jt.value();
+                    } else {
+                        last_status[it.key()] = it.value();
+                    }
+                }
+            }
+            // Always force webhooks.state="ready" before forwarding
+            stripped["params"]["status"]["webhooks"]["state"]         = "ready";
+            stripped["params"]["status"]["webhooks"]["state_message"] = "Printer is ready";
             json notify;
             notify["jsonrpc"] = "2.0";
             notify["method"]  = "notify_status_update";
@@ -393,6 +431,25 @@ void BridgeServer::broadcast_update(const json& cc2_update) {
 
     // ── Case 4: Standard status update ──────────────────────────────────────
     {
+        // Merge incoming fields into last_status cache so synthesis handlers
+        // always have fresh data without a second CC2 round-trip.
+        if (cc2_update.contains("params") && cc2_update["params"].is_object() &&
+            cc2_update["params"].contains("status") &&
+            cc2_update["params"]["status"].is_object()) {
+            std::lock_guard<std::mutex> lk(status_mutex);
+            auto& incoming = cc2_update["params"]["status"];
+            for (auto it = incoming.begin(); it != incoming.end(); ++it) {
+                if (last_status.contains(it.key()) &&
+                    last_status[it.key()].is_object() && it.value().is_object()) {
+                    // Merge nested objects (CC2 may send partial toolhead updates)
+                    for (auto jt = it.value().begin(); jt != it.value().end(); ++jt)
+                        last_status[it.key()][jt.key()] = jt.value();
+                } else {
+                    last_status[it.key()] = it.value();
+                }
+            }
+        }
+
         json notify;
         notify["jsonrpc"] = "2.0";
         notify["method"]  = "notify_status_update";
@@ -401,11 +458,12 @@ void BridgeServer::broadcast_update(const json& cc2_update) {
         } else {
             notify["params"] = json::array({cc2_update});
         }
-        // Always force webhooks.state="ready" in status pushes so Mainsail
+        // ALWAYS force webhooks.state="ready" in every status push so Mainsail
         // never enters "reinitializing" due to a transient CC2 startup state.
+        // We inject even if CC2 didn't include webhooks in this particular push;
+        // Mainsail's incremental store will merge the fields correctly.
         json& p = notify["params"][0];
-        if (p.is_object() && p.contains("status") && p["status"].is_object() &&
-            p["status"].contains("webhooks")) {
+        if (p.is_object() && p.contains("status") && p["status"].is_object()) {
             p["status"]["webhooks"]["state"]         = "ready";
             p["status"]["webhooks"]["state_message"] = "Printer is ready";
         }
@@ -510,25 +568,21 @@ void BridgeServer::setup_http_routes(hv::HttpService& svc) {
 
     // ── Forwarded to CC2 ──────────────────────────────────────────────────
 
-    // GET /printer/info
-    svc.GET("/printer/info", [this](HttpRequest*, HttpResponse* resp) -> int {
-        json cc2 = client->request("info");
-        resp->content_type = APPLICATION_JSON;
-        if (!cc2.contains("result")) {
-            json e; e["error"] = {{"message", "CC2 not connected"}};
-            resp->body = e.dump(); return 500;
-        }
-        json r = cc2["result"];
-        // Always force "ready" — CC2 may transiently report "startup" and that
-        // would send Mainsail straight into a 2-second reinitializing loop.
-        r["state"]         = "ready";
-        r["state_message"] = "Printer is ready";
-        // Add Klipper-style fields OrcaSlicer expects
-        if (!r.contains("klipper_path"))
-            r["klipper_path"] = r.value("elegoo_path", "/home/eeb001/elegoo");
-        if (!r.contains("components"))
-            r["components"] = json::array({"webhooks", "extruder", "heaters", "gcode"});
+    // GET /printer/info — synthesized; no CC2 round-trip.
+    // Always return "ready" so OrcaSlicer / Mainsail never see a 500 here.
+    svc.GET("/printer/info", [](HttpRequest*, HttpResponse* resp) -> int {
+        json r;
+        r["state"]            = "ready";
+        r["state_message"]    = "Printer is ready";
+        r["klipper_path"]     = "/home/eeb001/elegoo";
+        r["software_version"] = "v0.11.0-cc2bridge";
+        r["hostname"]         = "elegoo-cc2";
+        r["components"]       = json::array({"webhooks", "extruder", "heaters", "gcode",
+                                             "fan", "idle_timeout", "toolhead",
+                                             "virtual_sdcard", "print_stats",
+                                             "display_status"});
         json out; out["result"] = r;
+        resp->content_type = APPLICATION_JSON;
         resp->body = out.dump();
         return 200;
     });
@@ -1273,6 +1327,24 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
         return;
     }
 
+    // printer.info — synthesized entirely; no CC2 round-trip needed.
+    // Returning a synthesized "ready" prevents Mainsail from entering its
+    // 2-second polling loop on ANY transient CC2 disconnect/timeout.
+    if (method == "printer.info") {
+        json r;
+        r["state"]            = "ready";
+        r["state_message"]    = "Printer is ready";
+        r["klipper_path"]     = "/home/eeb001/elegoo";
+        r["software_version"] = "v0.11.0-cc2bridge";
+        r["hostname"]         = "elegoo-cc2";
+        r["components"]       = json::array({"webhooks", "extruder", "heaters", "gcode",
+                                             "fan", "idle_timeout", "toolhead",
+                                             "virtual_sdcard", "print_stats",
+                                             "display_status"});
+        send_response(r);
+        return;
+    }
+
     if (method == "access.oneshot_token") {
         send_response("");
         return;
@@ -1810,10 +1882,9 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
         // ── STATUS ────────────────────────────────────────────────────────
         if (up == "STATUS") {
             broadcast_gcode_response("// echo:STATUS");
-            json qs = client->request("objects/query",
-                                      json({{"objects", nullptr}}));
-            if (qs.contains("result") && qs["result"].contains("status")) {
-                auto& st = qs["result"]["status"];
+            json st;
+            { std::lock_guard<std::mutex> lk(status_mutex); st = last_status; }
+            if (!st.empty()) {
                 std::ostringstream msg;
                 msg << std::fixed << std::setprecision(1);
                 // State
@@ -1855,10 +1926,9 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
         // ── GET_POSITION ──────────────────────────────────────────────────
         if (up == "GET_POSITION") {
             broadcast_gcode_response("// echo:GET_POSITION");
-            json qs = client->request("objects/query",
-                                      json({{"objects", nullptr}}));
-            if (qs.contains("result") && qs["result"].contains("status")) {
-                auto& st = qs["result"]["status"];
+            json st;
+            { std::lock_guard<std::mutex> lk(status_mutex); st = last_status; }
+            if (!st.empty()) {
                 std::ostringstream msg;
                 msg << std::fixed << std::setprecision(6);
                 // toolhead.position = [x, y, z, e]
@@ -1904,9 +1974,9 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
         // Report extruder + bed temperatures in standard "ok T:xx/xx B:xx/xx" format.
         if (cmd_is("M105")) {
             broadcast_gcode_response("// echo:" + script);
-            json qs = client->request("objects/query", json({{"objects", nullptr}}));
-            if (qs.contains("result") && qs["result"].contains("status")) {
-                auto& st = qs["result"]["status"];
+            json st;
+            { std::lock_guard<std::mutex> lk(status_mutex); st = last_status; }
+            if (!st.empty()) {
                 std::ostringstream msg;
                 msg << std::fixed << std::setprecision(1) << "ok";
                 if (st.contains("extruder"))
@@ -1924,9 +1994,9 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
         // ── M114 (current position — Marlin format) ───────────────────────
         if (cmd_is("M114")) {
             broadcast_gcode_response("// echo:" + script);
-            json qs = client->request("objects/query", json({{"objects", nullptr}}));
-            if (qs.contains("result") && qs["result"].contains("status")) {
-                auto& st = qs["result"]["status"];
+            json st;
+            { std::lock_guard<std::mutex> lk(status_mutex); st = last_status; }
+            if (!st.empty()) {
                 double x = 0, y = 0, z = 0, e = 0;
                 if (st.contains("gcode_move") &&
                     st["gcode_move"].contains("gcode_position")) {
@@ -1973,10 +2043,10 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
         // ── QUERY_ENDSTOPS / M119 ─────────────────────────────────────────
         if (cmd_is("QUERY_ENDSTOPS") || cmd_is("M119")) {
             broadcast_gcode_response("// echo:" + script);
-            json qs = client->request("objects/query", json({{"objects", nullptr}}));
+            json st;
+            { std::lock_guard<std::mutex> lk(status_mutex); st = last_status; }
             bool printed = false;
-            if (qs.contains("result") && qs["result"].contains("status")) {
-                auto& st = qs["result"]["status"];
+            if (!st.empty()) {
                 // Prefer query_endstops.last_query if CC2 exposes it
                 if (st.contains("query_endstops") &&
                     st["query_endstops"].contains("last_query") &&
@@ -2010,10 +2080,10 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
         // ── BED_MESH_OUTPUT ───────────────────────────────────────────────
         if (cmd_is("BED_MESH_OUTPUT")) {
             broadcast_gcode_response("// echo:" + script);
-            json qs = client->request("objects/query", json({{"objects", nullptr}}));
+            json st;
+            { std::lock_guard<std::mutex> lk(status_mutex); st = last_status; }
             bool printed = false;
-            if (qs.contains("result") && qs["result"].contains("status")) {
-                auto& st = qs["result"]["status"];
+            if (!st.empty()) {
                 if (st.contains("bed_mesh")) {
                     auto& mesh = st["bed_mesh"];
                     std::string profile = mesh.value("profile_name", "");
@@ -2055,10 +2125,10 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
         // ── SET_VELOCITY_LIMIT (no args → report current limits) ──────────
         if (up == "SET_VELOCITY_LIMIT") {
             broadcast_gcode_response("// echo:" + script);
-            json qs = client->request("objects/query", json({{"objects", nullptr}}));
-            if (qs.contains("result") && qs["result"].contains("status") &&
-                qs["result"]["status"].contains("toolhead")) {
-                auto& th = qs["result"]["status"]["toolhead"];
+            json st;
+            { std::lock_guard<std::mutex> lk(status_mutex); st = last_status; }
+            if (!st.empty() && st.contains("toolhead")) {
+                auto& th = st["toolhead"];
                 std::ostringstream msg;
                 msg << std::fixed << std::setprecision(0);
                 msg << "// velocity:"   << th.value("max_velocity",   300.0)
@@ -2082,23 +2152,27 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
     json cc2_resp = client->request(cc2_method, params);
 
     if (!cc2_resp.contains("result")) {
+        // For subscribe/query, never return an error — that causes Mainsail to
+        // enter the "reinitializing" loop.  Return a synthetic ready status from
+        // the cache (populated once CC2 connects) so Mainsail stays happy.
+        if (method == "printer.objects.subscribe" ||
+            method == "printer.objects.query") {
+            json result;
+            {
+                std::lock_guard<std::mutex> lk(status_mutex);
+                result["status"] = last_status.empty() ? json::object() : last_status;
+            }
+            result["status"]["webhooks"]["state"]         = "ready";
+            result["status"]["webhooks"]["state_message"] = "Printer is ready";
+            result["eventtime"] = (double)time(nullptr);
+            send_response(result);
+            return;
+        }
         send_error("CC2 request failed or timed out");
         return;
     }
 
     json result = cc2_resp["result"];
-
-    // Special post-processing for printer.info
-    if (method == "printer.info") {
-        // ALWAYS force "ready" — CC2 may transiently return "startup" during
-        // reconnects, which would send Mainsail into a 2-second polling loop.
-        result["state"]         = "ready";
-        result["state_message"] = "Printer is ready";
-        if (!result.contains("klipper_path"))
-            result["klipper_path"] = result.value("elegoo_path", "/home/eeb001/elegoo");
-        if (!result.contains("components"))
-            result["components"] = json::array({"webhooks", "extruder", "heaters"});
-    }
 
     // ── Inject virtual Mainsail-required objects ──────────────────────────
     // Mainsail warns if these are absent; CC2 doesn't expose them as gcode
