@@ -335,6 +335,14 @@ void BridgeServer::broadcast_update(const json& cc2_update) {
         } else {
             notify["params"] = json::array({cc2_update});
         }
+        // Always force webhooks.state="ready" in status pushes so Mainsail
+        // never enters "reinitializing" due to a transient CC2 startup state.
+        json& p = notify["params"][0];
+        if (p.is_object() && p.contains("status") && p["status"].is_object() &&
+            p["status"].contains("webhooks")) {
+            p["status"]["webhooks"]["state"]         = "ready";
+            p["status"]["webhooks"]["state_message"] = "Printer is ready";
+        }
         std::string payload = notify.dump();
         std::lock_guard<std::mutex> lock(ws_clients_mutex);
         for (auto& ch : ws_clients)
@@ -894,14 +902,14 @@ void BridgeServer::setup_http_routes(hv::HttpService& svc) {
         return 200;
     };
     svc.GET("/server/files/logs/klippy.log", [serve_log](HttpRequest*, HttpResponse* resp) -> int {
-        return serve_log("/home/eeb001/printer_data/logs/elegoo.log", resp);
+        return serve_log(LOGS_ROOT + "/elegoo.log", resp);
     });
     svc.GET("/server/files/logs/moonraker.log", [serve_log](HttpRequest*, HttpResponse* resp) -> int {
-        return serve_log("/home/eeb001/printer_data/logs/elegoo.log", resp);
+        return serve_log(LOGS_ROOT + "/elegoo.log", resp);
     });
     // Flat path fallback (some Mainsail versions request without root prefix)
     svc.GET("/server/files/klippy.log", [serve_log](HttpRequest*, HttpResponse* resp) -> int {
-        return serve_log("/home/eeb001/printer_data/logs/elegoo.log", resp);
+        return serve_log(LOGS_ROOT + "/elegoo.log", resp);
     });
 
     // GET /server/files/{root}/{path...}  — serve actual file
@@ -1187,11 +1195,6 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
         json r;
         r["gcode_store"] = json::array();
         send_response(r);
-        return;
-    }
-
-    if (method == "server.files.list") {
-        send_response(json::array());
         return;
     }
 
@@ -1614,6 +1617,50 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
         json r; r["spool_id"] = params.value("spool_id", json(nullptr));
         send_response(r);
         return;
+    }
+
+    // ── HELP command interception ─────────────────────────────────────────
+    // CC2 never sends gcode_response back for HELP, so synthesize it here
+    // by calling gcode/help and formatting the result for the console.
+    if (method == "printer.gcode.script") {
+        std::string script = params.value("script", "");
+        // Trim + uppercase for comparison
+        std::string up;
+        for (char c : script)
+            up += (c >= 'a' && c <= 'z') ? char(c - 'a' + 'A') : c;
+        size_t s = up.find_first_not_of(' ');
+        size_t e = up.find_last_not_of(' ');
+        if (s != std::string::npos) up = up.substr(s, e - s + 1);
+
+        bool is_help = (up == "HELP" || (up.size() > 5 && up.substr(0, 5) == "HELP "));
+        if (is_help) {
+            broadcast_gcode_response("// echo:" + script);
+            std::string filter;
+            if (up.size() > 5) {
+                filter = up.substr(5);
+                size_t f = filter.find_first_not_of(' ');
+                if (f != std::string::npos) filter = filter.substr(f);
+            }
+            json help_resp = client->request("gcode/help", json::object());
+            if (help_resp.contains("result") && help_resp["result"].is_object()) {
+                std::string help_text;
+                for (auto& kv : help_resp["result"].items()) {
+                    if (!filter.empty() && kv.key() != filter) continue;
+                    std::string desc;
+                    if (kv.value().is_string())
+                        desc = kv.value().get<std::string>();
+                    else
+                        desc = kv.value().dump();
+                    help_text += kv.key() + ": " + desc + "\n";
+                }
+                if (!help_text.empty())
+                    broadcast_gcode_response(help_text);
+                else if (!filter.empty())
+                    broadcast_gcode_response("!! Unknown command: " + filter);
+            }
+            send_response(json("ok"));
+            return;
+        }
     }
 
     // ── Forward to CC2 ────────────────────────────────────────────────────
