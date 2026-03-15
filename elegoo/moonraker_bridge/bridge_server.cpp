@@ -372,6 +372,27 @@ void BridgeServer::setup_http_routes(hv::HttpService& svc) {
         std::cerr << "[http] 404 " << req->path << "\n";
         return 404;
     };
+    // /server/files/roots  — Mainsail may call this via HTTP (not just WS).
+    // Must come before the /server/files/* wildcard catch-all.
+    svc.GET("/server/files/roots", [](HttpRequest*, HttpResponse* resp) -> int {
+        json r = json::array();
+        json gcodes;
+        gcodes["name"]        = "gcodes";
+        gcodes["path"]        = "/opt/usr/gcode";
+        gcodes["permissions"] = "rw";
+        r.push_back(gcodes);
+        json config;
+        config["name"]        = "config";
+        config["path"]        = "/opt/usr/config";
+        config["permissions"] = "rw";
+        r.push_back(config);
+        json out; out["result"] = r;
+        resp->content_type = APPLICATION_JSON;
+        resp->body = out.dump();
+        std::cerr << "[http] GET /server/files/roots -> 200\n";
+        return 200;
+    });
+
     // /server/files/list?root=gcodes  — return empty list (no files uploaded yet)
     svc.GET("/server/files/list", [](HttpRequest*, HttpResponse* resp) -> int {
         resp->content_type = APPLICATION_JSON;
@@ -379,16 +400,20 @@ void BridgeServer::setup_http_routes(hv::HttpService& svc) {
         return 200;
     });
 
-    // /server/files/get_directory?path=config  — return empty directory object
+    // /server/files/get_directory?path=config  — return empty directory object.
     // Mainsail's Config Files panel calls this via HTTP (not WS) to list the
     // config root. Without this, the /server/files/* wildcard returns a 404
     // and Mainsail shows "No configuration directory found".
-    svc.GET("/server/files/get_directory", [](HttpRequest*, HttpResponse* resp) -> int {
+    svc.GET("/server/files/get_directory", [](HttpRequest* req, HttpResponse* resp) -> int {
+        std::string path = req->GetParam("path");
+        std::cerr << "[http] GET /server/files/get_directory path=" << path << "\n";
         json r;
         r["dirs"]  = json::array();
         r["files"] = json::array();
         r["disk_usage"] = {{"total", 6700000000LL}, {"used", 1200000000LL}, {"free", 5000000000LL}};
-        r["root_info"] = {{"name", "config"}, {"permissions", "r"}};
+        // Use the requested root name (or "config" as fallback) for root_info
+        std::string root_name = path.empty() ? "config" : path.substr(0, path.find('/'));
+        r["root_info"] = {{"name", root_name}, {"permissions", "rw"}};
         json out; out["result"] = r;
         resp->content_type = APPLICATION_JSON;
         resp->body = out.dump();
