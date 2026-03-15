@@ -4,6 +4,7 @@
 #include "bridge_server.h"
 
 #include <iostream>
+#include <fstream>
 #include <sstream>
 #include <thread>
 #include <chrono>
@@ -420,6 +421,32 @@ void BridgeServer::setup_http_routes(hv::HttpService& svc) {
         return 200;
     });
 
+    // ── Log file serving ─────────────────────────────────────────────────
+    // Mainsail's Log Files panel requests klippy.log and moonraker.log.
+    // Serve the actual CC2 log if it exists, otherwise return a stub.
+    auto serve_log = [](const std::string& log_path, HttpResponse* resp) -> int {
+        resp->SetHeader("Content-Type", "text/plain");
+        std::ifstream ifs(log_path);
+        if (ifs.good()) {
+            std::ostringstream ss;
+            ss << ifs.rdbuf();
+            resp->body = ss.str();
+        } else {
+            resp->body = "[moonraker_bridge] Log not found: " + log_path + "\n";
+        }
+        return 200;
+    };
+    svc.GET("/server/files/logs/klippy.log", [serve_log](HttpRequest*, HttpResponse* resp) -> int {
+        return serve_log("/home/eeb001/printer_data/logs/elegoo.log", resp);
+    });
+    svc.GET("/server/files/logs/moonraker.log", [serve_log](HttpRequest*, HttpResponse* resp) -> int {
+        return serve_log("/home/eeb001/printer_data/logs/elegoo.log", resp);
+    });
+    // Flat path fallback (some Mainsail versions request without root prefix)
+    svc.GET("/server/files/klippy.log", [serve_log](HttpRequest*, HttpResponse* resp) -> int {
+        return serve_log("/home/eeb001/printer_data/logs/elegoo.log", resp);
+    });
+
     svc.GET("/server/files/*",       json_404);
     svc.POST("/server/files/*",      json_404);
     svc.Handle("DELETE", "/server/files/*", json_404);
@@ -435,6 +462,32 @@ void BridgeServer::setup_http_routes(hv::HttpService& svc) {
         resp->body = "{\"result\":{\"gcode_store\":[]}}";
         return 200;
     });
+    // ── /machine/peripherals/*  (Mainsail Devices panel) ────────────────
+    svc.GET("/machine/peripherals/serial", [](HttpRequest*, HttpResponse* resp) -> int {
+        json out; out["result"] = {{"serial_devices", json::array()}};
+        resp->content_type = APPLICATION_JSON;
+        resp->body = out.dump();
+        return 200;
+    });
+    svc.GET("/machine/peripherals/usb", [](HttpRequest*, HttpResponse* resp) -> int {
+        json out; out["result"] = {{"usb_devices", json::array()}};
+        resp->content_type = APPLICATION_JSON;
+        resp->body = out.dump();
+        return 200;
+    });
+    svc.GET("/machine/peripherals/video", [](HttpRequest*, HttpResponse* resp) -> int {
+        json out; out["result"] = {{"v4l2_devices", json::array()}};
+        resp->content_type = APPLICATION_JSON;
+        resp->body = out.dump();
+        return 200;
+    });
+    svc.GET("/machine/peripherals/canbus", [](HttpRequest*, HttpResponse* resp) -> int {
+        json out; out["result"] = {{"interfaces", json::array()}};
+        resp->content_type = APPLICATION_JSON;
+        resp->body = out.dump();
+        return 200;
+    });
+
     svc.GET("/machine/*",            json_404);
     svc.POST("/machine/*",           json_404);
 
@@ -580,7 +633,7 @@ void BridgeServer::handle_ws_rpc(const WebSocketChannelPtr& ch, const std::strin
         json config;
         config["name"]        = "config";
         config["path"]        = "/opt/usr/config";
-        config["permissions"] = "r";
+        config["permissions"] = "rw";
         r.push_back(config);
         send_response(r);
         return;
